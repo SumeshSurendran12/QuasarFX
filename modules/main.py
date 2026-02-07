@@ -8,6 +8,7 @@ from pathlib import Path
 import time
 import pandas as pd
 import numpy as np
+import random
 from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import DummyVecEnv
 from stable_baselines3.common.callbacks import BaseCallback
@@ -30,7 +31,8 @@ from config import (
     DEVICE_TYPE,
     PPO_PARAMS,
     PPO_VERBOSE,
-    EPISODE_LENGTH
+    EPISODE_LENGTH,
+    GRID_SEARCH_PARAMS
 )
 import json
 from data_fetcher import DataFetcher
@@ -79,6 +81,9 @@ if DEVICE_TYPE == "directml":
         print(f"Error configuring DirectML: {e}")
         print("Falling back to CPU")
         DEVICE = "cpu"
+elif torch.cuda.is_available():
+    DEVICE = "cuda"
+    print(f"Using CUDA device: {torch.cuda.get_device_name(0)}")
 else:
     DEVICE = "cpu"
     print("Using CPU device")
@@ -88,6 +93,21 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Define reward shaping configuration
+DEFAULT_REWARD_CONFIG = {
+    "weekly_trade_bonus": 0.0,
+    "win_streak_bonus": 0.0,
+    "loss_penalty": 0.0,
+    "weekly_profit_bonus": 0.0,
+}
+
+# Model selection configuration (tune these for higher-quality search)
+MODEL_SELECTION_ENABLED = True
+MODEL_SELECTION_TRIALS = 6
+MODEL_SELECTION_SEEDS = [0, 1, 2]
+MODEL_SELECTION_TIMESTEPS = max(20000, MAX_TIMESTEPS // 5)
+FINAL_TRAIN_SEEDS = [0, 1, 2]
+VAL_FRACTION = 0.1
+TEST_FRACTION = 0.1
 
 
 def learning_rate_schedule(progress):
@@ -106,10 +126,7 @@ def learning_rate_schedule(progress):
     final_lr = FINAL_LR
     min_lr = MIN_LR  # Minimum learning rate floor
     warmup_steps = WARMUP_STEPS  # Fraction of training for warmup
-     # Calculate date range
-    end_date = datetime.now()
-    start_date = end_date - timedelta(days=YEARS * 365)  # Use timedelta instead of DateOffset
-    print(f"Received start_date: {start_date}, end_date: {end_date}")
+    progress = max(0.0, min(1.0, float(progress)))
     
     if progress < warmup_steps:
         # Linear warmup
@@ -123,23 +140,24 @@ def learning_rate_schedule(progress):
     
     
 
-def fetch_historical_data(self, download_if_missing=False, symbol=None, timeframe=None, start_date=None, end_date=None):
+def fetch_historical_data(download_if_missing=False, symbol=None, timeframe=None, start_date=None, end_date=None):
     """Download historical data using DataFetcher
     
     Args:
         symbol: Trading symbol (e.g., 'EURUSD')
         timeframe: Timeframe in Alpha Vantage format ('1m', '5m', '15m', '30m', '1h', '4h', '1d', '1w')
-        years: Number of years of historical data to download
+        start_date: Optional start date for calculating the number of years to request
+        end_date: Optional end date for calculating the number of years to request
     """
-
-    end_date = datetime.now()
-    start_date = end_date - timedelta(days=YEARS * 365)
+    symbol = symbol or SYMBOL
+    timeframe = timeframe or TIMEFRAME
+    end_date = end_date or datetime.now()
+    start_date = start_date or end_date - timedelta(days=YEARS * 365)
+    years = max(1, int(round((end_date - start_date).days / 365)))
     
-    logger.info(f"Downloading {YEARS} years of historical data for {symbol} at {timeframe} timeframe")
+    logger.info(f"Downloading {years} years of historical data for {symbol} at {timeframe} timeframe")
     
     try:
-       
-
         # Calculate expected data points
         total_days = (end_date - start_date).days
         if timeframe == "15m":
@@ -158,14 +176,15 @@ def fetch_historical_data(self, download_if_missing=False, symbol=None, timefram
         # Use DataFetcher to get historical data
         fetcher = DataFetcher()
         df = fetcher.fetch_historical_data(
-        symbol=symbol,
-        timeframe=timeframe,
-        years=YEARS,
+            download_if_missing=download_if_missing,
+            symbol=symbol,
+            timeframe=timeframe,
+            years=years,
         )
 
-        if df.empty:
-                    logger.error("No data received for the specified date range")
-                    return None
+        if df is None or df.empty:
+            logger.error("No data received for the specified date range")
+            return None
                 
         # Save to CSV using Path
         output_file = Path("data") / f"{symbol}_{timeframe}_{start_date.strftime('%Y%m%d')}_{end_date.strftime('%Y%m%d')}.csv"
@@ -182,9 +201,12 @@ def fetch_historical_data(self, download_if_missing=False, symbol=None, timefram
         return None
 
 class CustomRewardWrapper(gym.Wrapper):
-    def __init__(self, env, reward_config):
+    def __init__(self, env, reward_config=None):
         super().__init__(env)
-        self.reward_config = reward_config
+        merged_config = DEFAULT_REWARD_CONFIG.copy()
+        if reward_config is not None:
+            merged_config.update(reward_config)
+        self.reward_config = merged_config
         self.win_streak = 0
         self.loss_streak = 0
         self.weekly_trades = 0
@@ -311,6 +333,10 @@ class ProgressCallback(BaseCallback):
         self.last_update = time.time()
         self.episode_rewards = []
         self.episode_lengths = []
+        self.current_episode_reward = 0.0
+        self.current_episode_length = 0
+        self.episode_count = 0
+        self.last_episode_reward = None
         self.trade_history = []
         self.best_reward = float('-inf')
         self.best_model_path = None
@@ -327,7 +353,7 @@ class ProgressCallback(BaseCallback):
                 'win_rate': 0.0,
                 'avg_profit': 0.0,
                 'avg_loss': 0.0,
-            'profit_factor': 0.0,
+                'profit_factor': 0.0,
                 'max_consecutive_wins': 0,
                 'max_consecutive_losses': 0
             }
@@ -382,8 +408,8 @@ class ProgressCallback(BaseCallback):
         # Create models directory if it doesn't exist
         models_dir = Path("models")
         models_dir.mkdir(exist_ok=True)
-            
-            # Save regular checkpoint
+
+        # Save regular checkpoint
         checkpoint_path = models_dir / f"checkpoint_{episode}.zip"
         model.save(str(checkpoint_path))
             
@@ -409,19 +435,33 @@ class ProgressCallback(BaseCallback):
         """Called at each step during training"""
         # Get current time
         current_time = time.time()
+
+        rewards = self.locals.get('rewards')
+        dones = self.locals.get('dones')
+        if rewards is not None:
+            if np.isscalar(rewards):
+                self.current_episode_reward += float(rewards)
+            else:
+                self.current_episode_reward += float(rewards[0])
+        self.current_episode_length += 1
+        if dones is not None:
+            done = bool(dones) if np.isscalar(dones) else bool(dones[0])
+            if done:
+                self.episode_count += 1
+                self.last_episode_reward = self.current_episode_reward
+                self.episode_rewards.append(self.current_episode_reward)
+                self.episode_lengths.append(self.current_episode_length)
+                self.current_episode_reward = 0.0
+                self.current_episode_length = 0
         
         # Update only if enough time has passed
         if current_time - self.last_update >= self.update_interval:
             self.last_update = current_time
             
             # Get current episode info - use EPISODE_LENGTH from config instead of max_steps
-            episode = self.n_calls // EPISODE_LENGTH
-            episode_reward = self.training_env.get_attr('episode_reward')[0] if hasattr(self.training_env.envs[0], 'episode_reward') else 0 # type: ignore
-            episode_length = EPISODE_LENGTH
-            
-            # Update episode statistics
-            self.episode_rewards.append(episode_reward)
-            self.episode_lengths.append(episode_length)
+            episode = self.episode_count
+            episode_reward = self.last_episode_reward if self.last_episode_reward is not None else self.current_episode_reward
+            episode_length = self.episode_lengths[-1] if self.episode_lengths else self.current_episode_length
                     
             # Calculate running averages
             avg_reward = np.mean(self.episode_rewards[-100:]) if self.episode_rewards else 0
@@ -456,13 +496,13 @@ class ProgressCallback(BaseCallback):
             )
             
             # Save model if it's the best so far
-            if episode_reward > self.best_reward:
-                self.best_reward = episode_reward
-                self.save_model(self.model, episode, episode_reward, is_best=True)
+            if self.last_episode_reward is not None and self.last_episode_reward > self.best_reward:
+                self.best_reward = self.last_episode_reward
+                self.save_model(self.model, episode, self.last_episode_reward, is_best=True)
             
             # Save regular checkpoint every 1000 episodes
-            if episode % 1000 == 0:
-                self.save_model(self.model, episode, episode_reward)
+            if self.last_episode_reward is not None and episode > 0 and episode % 1000 == 0:
+                self.save_model(self.model, episode, self.last_episode_reward)
             
             # Log to wandb
             wandb.log({
@@ -529,6 +569,222 @@ class LearningRateMonitor(BaseCallback):
         
         return True
 
+def split_train_val_test(df, val_fraction=0.1, test_fraction=0.1):
+    """Split data into train/val/test sets preserving time order."""
+    if not 0.0 < val_fraction < 1.0 or not 0.0 < test_fraction < 1.0:
+        raise ValueError("val_fraction and test_fraction must be between 0 and 1.")
+    if val_fraction + test_fraction >= 1.0:
+        raise ValueError("val_fraction + test_fraction must be less than 1.")
+    train_end = int(len(df) * (1 - val_fraction - test_fraction))
+    val_end = int(len(df) * (1 - test_fraction))
+    if train_end <= 0 or val_end <= train_end or val_end >= len(df):
+        raise ValueError("Not enough data to create a train/val/test split.")
+    train_df = df.iloc[:train_end].copy()
+    val_df = df.iloc[train_end:val_end].copy()
+    test_df = df.iloc[val_end:].copy()
+    return train_df, val_df, test_df
+
+def _calculate_max_drawdown(equity_curve):
+    """Calculate max drawdown as a percentage from an equity curve."""
+    if not equity_curve:
+        return 0.0
+    peak = equity_curve[0]
+    max_dd = 0.0
+    for value in equity_curve:
+        if value > peak:
+            peak = value
+        if peak > 0:
+            drawdown = (peak - value) / peak
+            if drawdown > max_dd:
+                max_dd = drawdown
+    return max_dd * 100.0
+
+def evaluate_model(model, eval_df, tag="eval"):
+    """Evaluate model on out-of-sample data and return metrics."""
+    if eval_df is None or eval_df.empty:
+        logger.warning("Evaluation skipped: eval_df is empty.")
+        return {}
+
+    env = TradingEnvironment(eval_df.copy())
+    obs, _ = env.reset()
+    data_len = len(env.data['close'])
+
+    total_reward = 0.0
+    episode_reward = 0.0
+    episode_rewards = []
+    equity_curve = [env.balance]
+    episode_count = 0
+    steps = 0
+
+    while env.current_step + 1 < data_len:
+        action, _ = model.predict(obs, deterministic=True)
+        obs, reward, done, _, _ = env.step(action)
+        total_reward += reward
+        episode_reward += reward
+        steps += 1
+        equity_curve.append(env.balance)
+
+        if done:
+            episode_count += 1
+            episode_rewards.append(episode_reward)
+            episode_reward = 0.0
+
+    if episode_reward != 0.0:
+        episode_rewards.append(episode_reward)
+
+    trade_history = env.trade_history
+    total_trades = len(trade_history)
+    profits = [t['reward'] for t in trade_history if t.get('reward', 0) > 0]
+    losses = [abs(t['reward']) for t in trade_history if t.get('reward', 0) < 0]
+    gross_profit = sum(profits)
+    gross_loss = sum(losses)
+    net_profit = gross_profit - gross_loss
+    win_rate = (len(profits) / total_trades) if total_trades > 0 else 0.0
+    profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else (float('inf') if gross_profit > 0 else 0.0)
+    avg_trade_pnl = (net_profit / total_trades) if total_trades > 0 else 0.0
+    return_pct = ((equity_curve[-1] - equity_curve[0]) / equity_curve[0] * 100.0) if equity_curve else 0.0
+    max_drawdown = _calculate_max_drawdown(equity_curve)
+
+    metrics = {
+        "steps": steps,
+        "episodes": episode_count,
+        "total_reward": total_reward,
+        "avg_episode_reward": float(np.mean(episode_rewards)) if episode_rewards else 0.0,
+        "total_trades": total_trades,
+        "win_rate": win_rate,
+        "profit_factor": profit_factor,
+        "net_profit": net_profit,
+        "avg_trade_pnl": avg_trade_pnl,
+        "return_pct": return_pct,
+        "max_drawdown_pct": max_drawdown,
+    }
+
+    logger.info("\n=== Out-of-Sample Evaluation ===")
+    logger.info(f"Steps: {metrics['steps']}")
+    logger.info(f"Episodes: {metrics['episodes']}")
+    logger.info(f"Total Reward: {metrics['total_reward']:.4f}")
+    logger.info(f"Avg Episode Reward: {metrics['avg_episode_reward']:.4f}")
+    logger.info(f"Total Trades: {metrics['total_trades']}")
+    logger.info(f"Win Rate: {metrics['win_rate']*100:.2f}%")
+    logger.info(f"Profit Factor: {metrics['profit_factor']:.2f}")
+    logger.info(f"Net Profit: {metrics['net_profit']:.2f}")
+    logger.info(f"Avg Trade PnL: {metrics['avg_trade_pnl']:.2f}")
+    logger.info(f"Return %: {metrics['return_pct']:.2f}%")
+    logger.info(f"Max Drawdown: {metrics['max_drawdown_pct']:.2f}%")
+    logger.info("===============================\n")
+
+    try:
+        wandb.log({f"{tag}/{k}": v for k, v in metrics.items()})
+    except Exception as e:
+        logger.warning(f"wandb.log failed during evaluation: {e}")
+
+    return metrics
+
+def _build_model(env, hyperparams=None, verbose_override=None):
+    hyperparams = hyperparams or {}
+    params = PPO_PARAMS.copy()
+    # Update PPO params that are part of PPO_PARAMS
+    for key in ['n_epochs', 'gamma', 'gae_lambda', 'clip_range', 'ent_coef', 'vf_coef', 'max_grad_norm', 'use_sde', 'sde_sample_freq', 'target_kl']:
+        if key in hyperparams:
+            params[key] = hyperparams[key]
+
+    n_steps = hyperparams.get('n_steps', N_STEPS)
+    batch_size = hyperparams.get('batch_size', BATCH_SIZE)
+    learning_rate = hyperparams.get('learning_rate', learning_rate_schedule(0))
+    verbose = PPO_VERBOSE if verbose_override is None else verbose_override
+
+    model = PPO(
+        "MlpPolicy",
+        env,
+        learning_rate=learning_rate,
+        n_steps=n_steps,
+        batch_size=batch_size,
+        device=DEVICE,
+        **params,
+        policy_kwargs=dict(
+            features_extractor_class=CustomFeaturesExtractor,
+            features_extractor_kwargs=dict(features_dim=64)
+        ),
+        verbose=verbose
+    )
+    return model
+
+def _hyperparams_valid(hyperparams):
+    n_steps = hyperparams.get('n_steps', N_STEPS)
+    batch_size = hyperparams.get('batch_size', BATCH_SIZE)
+    if batch_size > n_steps:
+        return False
+    return True
+
+def _sample_hyperparam_trials(grid_params, max_trials, rng):
+    keys = ['learning_rate', 'n_steps', 'batch_size', 'n_epochs', 'gamma', 'gae_lambda', 'clip_range', 'ent_coef', 'vf_coef']
+    trials = []
+    seen = set()
+    attempts = 0
+    while len(trials) < max_trials and attempts < max_trials * 10:
+        attempts += 1
+        trial = {}
+        for key in keys:
+            if key in grid_params:
+                trial[key] = rng.choice(grid_params[key])
+        if not _hyperparams_valid(trial):
+            continue
+        signature = tuple(sorted(trial.items()))
+        if signature in seen:
+            continue
+        seen.add(signature)
+        trials.append(trial)
+    return trials
+
+def _selection_score(metrics):
+    if not metrics:
+        return float('-inf')
+    score = metrics.get('return_pct', 0.0) - metrics.get('max_drawdown_pct', 0.0)
+    profit_factor = metrics.get('profit_factor', 0.0)
+    if profit_factor <= 1.0:
+        score -= 50.0
+    return score
+
+def _train_single_model(train_df, seed, hyperparams, timesteps, callbacks=None, verbose_override=None):
+    set_random_seed(seed)
+    env = DummyVecEnv([make_env(0, train_df, seed=seed, reward_config=REWARD_SHAPING)])
+    model = _build_model(env, hyperparams=hyperparams, verbose_override=verbose_override)
+    model.learn(total_timesteps=timesteps, callback=callbacks or [])
+    return model, env
+
+def run_model_selection(train_df, val_df):
+    rng = random.Random(42)
+    trials = _sample_hyperparam_trials(GRID_SEARCH_PARAMS, MODEL_SELECTION_TRIALS, rng)
+    if not trials:
+        logger.warning("No hyperparameter trials generated. Falling back to default params.")
+        return {}
+
+    best_score = float('-inf')
+    best_params = None
+
+    for trial_idx, hyperparams in enumerate(trials, start=1):
+        logger.info(f"Starting trial {trial_idx}/{len(trials)} with params: {hyperparams}")
+        for seed in MODEL_SELECTION_SEEDS:
+            model, env = _train_single_model(
+                train_df=train_df,
+                seed=seed,
+                hyperparams=hyperparams,
+                timesteps=MODEL_SELECTION_TIMESTEPS,
+                callbacks=[],
+                verbose_override=0
+            )
+            metrics = evaluate_model(model, val_df, tag=f"val_trial{trial_idx}_seed{seed}")
+            score = _selection_score(metrics)
+            logger.info(f"Trial {trial_idx} seed {seed} score: {score:.4f}")
+            if score > best_score:
+                best_score = score
+                best_params = hyperparams
+            env.close()
+            del model
+
+    logger.info(f"Best hyperparameters from selection: {best_params}")
+    return best_params or {}
+
 def train():
     """Main training function"""
     # Initialize wandb
@@ -556,23 +812,20 @@ def train():
     if df is None or df.empty:
         raise ValueError("No historical data loaded for training!")
 
+    # Split into train/val/test sets (time-ordered)
+    train_df, val_df, test_df = split_train_val_test(df, val_fraction=VAL_FRACTION, test_fraction=TEST_FRACTION)
+
+    # Run hyperparameter selection (optional)
+    selected_params = {}
+    if MODEL_SELECTION_ENABLED:
+        selected_params = run_model_selection(train_df, val_df)
+
     # Create vectorized environment
-    env = DummyVecEnv([make_env(i, df, reward_config=REWARD_SHAPING) for i in range(1)])
+    train_full_df = pd.concat([train_df, val_df]).copy()
+    env = DummyVecEnv([make_env(i, train_full_df, reward_config=REWARD_SHAPING) for i in range(1)])
 
     # Create model
-    model = PPO(
-            "MlpPolicy",
-            env,
-        learning_rate=learning_rate_schedule(0),
-            n_steps=N_STEPS,
-            batch_size=BATCH_SIZE,
-            **PPO_PARAMS,
-        policy_kwargs=dict(
-            features_extractor_class=CustomFeaturesExtractor,
-            features_extractor_kwargs=dict(features_dim=64)
-        ),
-        verbose=PPO_VERBOSE
-        )
+    model = _build_model(env, hyperparams=selected_params)
 
     # Create callbacks
     progress_callback = ProgressCallback(debug_logger)
@@ -583,6 +836,36 @@ def train():
             total_timesteps=MAX_TIMESTEPS,
         callback=[progress_callback, lr_monitor]
         )
+
+    # Evaluate on out-of-sample data (test set)
+    evaluate_model(model, test_df, tag="test_final")
+
+    # Train additional seeds for robustness and select best on test set
+    best_score = float('-inf')
+    best_model_path = Path("models") / "best_model.zip"
+    best_metadata_path = Path("models") / "best_model_metadata.json"
+    for seed in FINAL_TRAIN_SEEDS:
+        candidate_model, candidate_env = _train_single_model(
+            train_df=train_full_df,
+            seed=seed,
+            hyperparams=selected_params,
+            timesteps=MAX_TIMESTEPS,
+            callbacks=[progress_callback, lr_monitor]
+        )
+        metrics = evaluate_model(candidate_model, test_df, tag=f"test_seed{seed}")
+        score = _selection_score(metrics)
+        if score > best_score:
+            best_score = score
+            candidate_model.save(str(best_model_path))
+            with open(best_metadata_path, 'w') as f:
+                json.dump({
+                    "seed": seed,
+                    "score": score,
+                    "metrics": metrics,
+                    "timestamp": datetime.now().isoformat()
+                }, f, indent=4)
+        candidate_env.close()
+        del candidate_model
 
         # Save final model
     model.save("models/final_model")

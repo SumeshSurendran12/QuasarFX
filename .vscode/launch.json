@@ -1,0 +1,29 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Python: Main Module",
+            "type": "python",
+            "request": "launch",
+            "program": "${workspaceFolder}/modules/main.py",
+            "console": "integratedTerminal",
+            "justMyCode": true
+        },
+        {
+            "name": "Python: Live Trading",
+            "type": "python",
+            "request": "launch",
+            "program": "${workspaceFolder}/modules/live_trading.py",
+            "console": "integratedTerminal",
+            "justMyCode": true
+        },
+        {
+            "name": "Python: Test DirectML",
+            "type": "python",
+            "request": "launch",
+            "program": "${workspaceFolder}/test_directml.py",
+            "console": "integratedTerminal",
+            "justMyCode": true
+        }
+    ]
+}

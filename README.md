@@ -1,6 +1,6 @@
 # Forex Trading Bot with Reinforcement Learning
 
-A sophisticated Forex trading bot that uses Proximal Policy Optimization (PPO) reinforcement learning to make trading decisions. The bot features dynamic position sizing, AMD GPU acceleration via DirectML and OpenCL (specifically for AMD GPUs like the RX 6700/gfx1031, which do not support AMD ROCm), and live trading integration with MetaTrader 5.
+A sophisticated Forex trading bot that uses Proximal Policy Optimization (PPO) reinforcement learning to make trading decisions. The bot features dynamic position sizing, GPU acceleration via CUDA (for Nvidia GPUs like RTX 3070) or DirectML (for AMD GPUs), and live trading integration with MetaTrader 5.
 
 ## ⚡️ Data Provider: Dukascopy (NEW)
 
@@ -28,7 +28,7 @@ time,open,high,low,close,volume
 
 - **Reinforcement Learning**: PPO for autonomous trading decisions
 - **Dynamic Position Sizing**: Adjusts positions based on market/risk
-- **AMD GPU Acceleration**: DirectML and OpenCL (AMD ONLY)
+- **GPU Acceleration**: CUDA for Nvidia GPUs (e.g., RTX 3070) or DirectML for AMD GPUs
 - **Live Trading**: MetaTrader 5 integration for real-time trading
 - **Comprehensive Analytics**: Detailed performance tracking and visualization
 - **Risk Management**: Stop-loss, take-profit, trade frequency limits
@@ -37,24 +37,22 @@ time,open,high,low,close,volume
 
 ## ⚠️ Note on GPU Acceleration
 
-- **test_directml.py is currently not working** due to a bug in torch-directml ("TypeError: 'staticmethod' object is not callable").
-- Backtesting and training will **default to CPU** until this issue is fixed.
-- For updates, see [DirectML GitHub issues](https://github.com/microsoft/DirectML/issues).
+- **CUDA is enabled** for Nvidia GPUs like RTX 3070 (automatically detects CUDA if available).
+- For AMD GPUs, use DirectML (install torch-directml instead).
+- For updates, see [PyTorch CUDA docs](https://pytorch.org/get-started/locally/).
 
 > **Note:**
-> - No torchvision is required.
-> - Designed for AMD GPUs like RX 6700 (gfx1031) that do **not** support AMD ROCm.
-> - GPU acceleration via DirectML and OpenCL, not ROCm.
-> - For Nvidia GPUs, modify code to use CUDA backend in PyTorch.
-> - GPU acceleration tested with torch==2.0.1 and torch-directml==0.2.0.dev230426 (June 2024).
+> - Designed for Nvidia GPUs like RTX 3070 (CUDA) or AMD GPUs like RX 6700 (DirectML).
+> - GPU acceleration tested with torch==2.5.1+cu121 (CUDA 12.1).
+> - For AMD GPUs, modify requirements to use torch-directml.
 
 ## Setup
 
 ### Prerequisites
 
-- Python 3.10
+- Python 3.11
+- Nvidia GPU with CUDA support (e.g., RTX 3070) or AMD GPU
 - MetaTrader 5 account (for live trading)
-- AMD GPU (for acceleration)
 
 ### Weights & Biases (wandb) Setup
 
@@ -77,9 +75,9 @@ time,open,high,low,close,volume
 
 ## Technologies and Libraries for GPU Acceleration
 
-- **DirectML**: Hardware-accelerated deep learning on AMD GPUs ([GitHub](https://github.com/microsoft/DirectML))
-- **OpenCL**: Low-level GPU operations ([Khronos Group GitHub](https://github.com/KhronosGroup/OpenCL-ICD-Loader))
-- **PyTorch**: Deep learning framework, DirectML backend for AMD GPU
+- **CUDA**: Hardware-accelerated deep learning on Nvidia GPUs ([Nvidia CUDA](https://developer.nvidia.com/cuda-toolkit))
+- **DirectML**: For AMD GPUs ([GitHub](https://github.com/microsoft/DirectML))
+- **PyTorch**: Deep learning framework with CUDA backend
 - **NumPy, pandas**: Data processing
 
 ## Project Structure

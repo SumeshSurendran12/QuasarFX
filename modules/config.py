@@ -78,20 +78,20 @@ COMMISSION = 0.0001  # Commission per trade (0.01%)
 SLIPPAGE = 0.00005  # Slippage in price (0.5 pips)
 
 # === 4. Position Sizing ===
-MIN_POSITION_SIZE = 0.15  # Minimum position size in lots
-MAX_POSITION_SIZE = 0.30  # Maximum position size in lots
+MIN_POSITION_SIZE = 0.20  # Minimum position size in lots (increased for better returns)
+MAX_POSITION_SIZE = 0.40  # Maximum position size in lots (increased for better returns)
 POSITION_SIZE_INCREMENT = 0.05  # Increment for position sizing
 
 # === 5. Risk Management ===
 MAX_TRADES_PER_WEEK = 6  # Max trades allowed per week
 MAX_DAILY_TRADES = 10  # Max trades allowed per day
 MAX_WEEKLY_TRADES = 50  # Max trades allowed per week (hard cap)
-PROFIT_TARGET = 0.02  # Profit target per trade (2%)
-STOP_LOSS = 0.01  # Stop loss per trade (1%)
+PROFIT_TARGET = 0.03  # Profit target per trade (3% - increased for better returns)
+STOP_LOSS = 0.015  # Stop loss per trade (1.5% - increased to match risk-reward)
 
 # === 6. Training/Backtesting Parameters ===
 MAX_EPISODES = 2200000  # Maximum number of training episodes
-MAX_TIMESTEPS = 10000000  # Maximum number of training timesteps
+MAX_TIMESTEPS = 100000  # Maximum number of training timesteps (reduced for faster testing)
 MIN_EPISODES = 1000  # Minimum number of training episodes
 TARGET_WEEKLY_PROFIT = 1000.0  # Target profit per week in USD
 BATCH_SIZE = 32  # Training batch size
@@ -150,12 +150,12 @@ PPO_PARAMS = {
 
 # === 9. MetaTrader 5/Live Trading Config ===
 MT5_CONFIG = {
-    'MT5LOGIN': os.getenv('MT5LOGIN'),  # MT5 account number
-    'MT5PASSWORD': os.getenv('MT5PASSWORD'),  # MT5 password
-    'MT5SERVER': os.getenv('MT5SERVER'),  # MT5 broker server
+    'MT5LOGIN': os.getenv('MT5_LOGIN'),  # MT5 account number
+    'MT5PASSWORD': os.getenv('MT5_PASSWORD'),  # MT5 password
+    'MT5SERVER': os.getenv('MT5_SERVER'),  # MT5 broker server
     'MT5SYMBOL': "EURUSD",  # MT5 trading symbol
     'MT5TIMEFRAME': "M15",  # MT5 trading timeframe
-    'MODEL_PATH': str(Path(__file__).parent.parent / "models" / "forex_model_final.zip"),  # Path to trained model
+    'MODEL_PATH': str(Path(__file__).parent.parent / "models" / "best_model.zip"),  # Path to trained model
     'BASE_DEVIATION': 20,  # Base deviation in points
     'MAX_DEVIATION': 50,  # Max allowed deviation in points
     'MIN_DEVIATION': 10,  # Min allowed deviation in points
@@ -228,7 +228,7 @@ PORTFOLIO_AXIS_FONTSIZE = 12  # Font size for axis labels
 
 
 # === 12. Other/Advanced ===
-LOG_FILE_PATH = 'logs/swing_trading.log'  # Main log file path
+LOG_FILE_PATH = LOGS_DIRECTORY / "swing_trading.log"  # Main log file path
 DATA_CSV_PATH = 'data/{SYMBOL}_{{start}_{{end}.csv'  # Path to historical data CSV # type: ignore
 INITIAL_LR = 3e-4  # Initial learning rate for schedule
 FINAL_LR = 1e-4  # Final learning rate for schedule

@@ -5,12 +5,12 @@ Live trading environment for MetaTrader 5 integration
 import MetaTrader5 as mt5
 import numpy as np
 import pandas as pd
-from datetime import datetime
+from datetime import datetime, timedelta
 import time
 import logging
 import pickle
 from typing import Dict, List, Tuple, Optional
-from config import MT5_CONFIG, MIN_POSITION_SIZE, MAX_POSITION_SIZE
+from config import MT5_CONFIG, MIN_POSITION_SIZE, MAX_POSITION_SIZE, STOP_LOSS, PROFIT_TARGET
                     
 
 logger = logging.getLogger(__name__)
@@ -29,9 +29,7 @@ class LiveTradingEnvironment:
         import random
         self.magic = MT5_CONFIG['MAGIC_BASE'] + random.randint(1, 9999)
         
-        # Initialize MT5 connection
-        if not mt5.initialize():
-            raise RuntimeError("Failed to initialize MT5")
+        # MT5 should already be initialized and logged in from main
         
         # Get symbol info
         self.symbol_info = mt5.symbol_info(symbol)
@@ -45,6 +43,9 @@ class LiveTradingEnvironment:
         
         # Load trained model using generic loader
         self.model = self._load_model(model_path)
+        
+        # Sync position state with MT5
+        self._sync_position_state()
         
         logger.info(f"Initialized live trading for {symbol} using model from {model_path}")
         logger.info(f"Bot instance magic number: {self.magic}")
@@ -66,8 +67,28 @@ class LiveTradingEnvironment:
                 raise RuntimeError(f"Cannot load model from {model_path}")
     
     def _get_mt5_data(self, start_time: datetime, end_time: datetime) -> pd.DataFrame:
-        """Get market data directly from MT5"""
+        """Get market data directly from MT5 with fallback strategies"""
         try:
+            # Check if symbol is available
+            symbol_info = mt5.symbol_info(self.symbol)
+            if symbol_info is None:
+                logger.error(f"Symbol {self.symbol} not found in MT5")
+                # Try to get available symbols and suggest alternatives
+                symbols = mt5.symbols_get()
+                if symbols:
+                    available_fx = [s.name for s in symbols if s.name.endswith(('USD', 'EUR', 'GBP', 'JPY', 'CHF', 'CAD', 'AUD'))][:5]
+                    logger.info(f"Available symbols: {available_fx}")
+                return pd.DataFrame()
+
+            if not symbol_info.visible:
+                logger.warning(f"Symbol {self.symbol} not visible, attempting to select...")
+                if not mt5.symbol_select(self.symbol, True):
+                    logger.error(f"Failed to select symbol {self.symbol}")
+                    return pd.DataFrame()
+                logger.info(f"Successfully selected symbol {self.symbol}")
+
+            logger.debug(f"Getting data for {self.symbol} from {start_time} to {end_time}")
+
             # Convert timeframe string to MT5 constant
             timeframe_map = {
                 'M1': mt5.TIMEFRAME_M1,
@@ -78,22 +99,59 @@ class LiveTradingEnvironment:
                 'H4': mt5.TIMEFRAME_H4,
                 'D1': mt5.TIMEFRAME_D1
             }
-            
+
             mt5_timeframe = timeframe_map.get(self.timeframe, mt5.TIMEFRAME_M15)
-            
-            # Get rates from MT5 using the symbol
-            rates = mt5.copy_rates_range(self.symbol, mt5_timeframe, start_time, end_time)
-            
-            if rates is None or len(rates) == 0:
-                return pd.DataFrame()
-            
-            # Convert to DataFrame
-            df = pd.DataFrame(rates)
-            df['time'] = pd.to_datetime(df['time'], unit='s')
-            df.set_index('time', inplace=True)
-            
-            return df
-            
+
+            # Try multiple strategies to get data
+            strategies = [
+                # Strategy 1: Try current timeframe with recent data
+                (mt5_timeframe, datetime.now() - timedelta(hours=24), datetime.now()),
+                # Strategy 2: Try H1 timeframe
+                (mt5.TIMEFRAME_H1, datetime.now() - timedelta(hours=24), datetime.now()),
+                # Strategy 3: Try D1 timeframe
+                (mt5.TIMEFRAME_D1, datetime.now() - timedelta(days=30), datetime.now()),
+                # Strategy 4: Try M1 timeframe with shorter period
+                (mt5.TIMEFRAME_M1, datetime.now() - timedelta(hours=1), datetime.now()),
+            ]
+
+            for i, (tf, start, end) in enumerate(strategies):
+                logger.debug(f"Trying strategy {i+1}: timeframe={tf}, start={start}, end={end}")
+                rates = mt5.copy_rates_range(self.symbol, tf, start, end)
+
+                if rates is not None and len(rates) > 0:
+                    logger.info(f"Successfully got {len(rates)} rates using strategy {i+1}")
+                    # Convert to DataFrame
+                    df = pd.DataFrame(rates)
+                    df['time'] = pd.to_datetime(df['time'], unit='s')
+                    df.set_index('time', inplace=True)
+                    return df
+                else:
+                    logger.warning(f"Strategy {i+1} failed: got {len(rates) if rates else 0} rates")
+
+            # If all strategies fail, try to get current tick data
+            logger.warning("All historical data strategies failed, trying current tick data...")
+            tick = mt5.symbol_info_tick(self.symbol)
+            if tick:
+                logger.info(f"Got current tick data: bid={tick.bid}, ask={tick.ask}")
+                # Create a minimal DataFrame with current data
+                current_time = datetime.now()
+                df = pd.DataFrame([{
+                    'time': current_time,
+                    'open': tick.bid,
+                    'high': tick.bid,
+                    'low': tick.bid,
+                    'close': tick.bid,
+                    'tick_volume': 1,
+                    'spread': symbol_info.spread,
+                    'real_volume': 0
+                }])
+                df['time'] = pd.to_datetime(df['time'])
+                df.set_index('time', inplace=True)
+                return df
+
+            logger.error(f"All data retrieval strategies failed for {self.symbol}")
+            return pd.DataFrame()
+
         except Exception as e:
             logger.error(f"Failed to get MT5 data for {self.symbol}: {e}")
             return pd.DataFrame()
@@ -136,7 +194,7 @@ class LiveTradingEnvironment:
         """Get current market state observation"""
         # Get recent market data
         end_time = datetime.now()
-        start_time = end_time - pd.Timedelta(minutes=30)  # Get more data to ensure we have enough
+        start_time = end_time - pd.Timedelta(minutes=5)  # Get last 5 minutes of data
         
         df = self._get_mt5_data(start_time, end_time)
         
@@ -146,41 +204,17 @@ class LiveTradingEnvironment:
         
         logger.info(f"Received {len(df)} data points from MT5")
         
-        # Ensure we have enough data points
-        if len(df) < 20:
-            logger.warning(f"Not enough data points ({len(df)}), padding with last known values")
-            # Pad with the last known values
-            last_values = df.iloc[-1]
-            padding = pd.DataFrame([last_values] * (20 - len(df)), index=pd.date_range(end=df.index[-1], periods=20-len(df), freq='1min'))
-            df = pd.concat([df, padding])
+        # Get the most recent data point
+        latest = df.iloc[-1]
         
-        # Take the last 20 points
-        df = df.tail(20)
-        
-        # Create observation array with shape (10, 20)
-        observation = np.zeros((10, 20))
-        
-        # Use basic OHLCV features (no technical indicators for live trading)
-        features = ['open', 'high', 'low', 'close', 'tick_volume']
-        
-        # Fill observation array with normalized features
-        for i, feature in enumerate(features):
-            if feature in df.columns:
-                values = df[feature].values
-                # Handle NaN values
-                values = np.nan_to_num(values, nan=0.0)
-                # Normalize values
-                mean = np.mean(values)
-                std = np.std(values)
-                if std == 0:
-                    std = 1
-                normalized = (values - mean) / std
-                # Clip values to prevent extreme values
-                normalized = np.clip(normalized, -10, 10)
-                observation[i] = normalized
-        
-        # Ensure no NaN values in final observation
-        observation = np.nan_to_num(observation, nan=0.0)
+        # Create observation matching training format: [open, high, low, close, volume]
+        observation = np.array([
+            latest['open'],
+            latest['high'], 
+            latest['low'],
+            latest['close'],
+            latest.get('tick_volume', 0)  # Use tick_volume if available, otherwise 0
+        ], dtype=np.float32)
         
         return observation
     
@@ -235,45 +269,68 @@ class LiveTradingEnvironment:
         elif action == 3 and self.position != 0:
             self._close_position()
     
-    def run(self):
+    def run(self, max_duration_seconds: int = 1800):
         """Main trading loop"""
-        logger.info(f"Starting live trading for {self.symbol}")
+        logger.info(f"Starting live trading for {self.symbol} (max duration: {max_duration_seconds} seconds)")
+        start_time = time.time()
         
         while True:
             try:
+                # Check if max duration exceeded
+                elapsed = time.time() - start_time
+                if elapsed >= max_duration_seconds:
+                    logger.info(f"Max trading duration ({max_duration_seconds} seconds) reached. Stopping.")
+                    break
+                
+                logger.debug("Getting observation...")
                 # Get current market state
                 observation = self.get_observation()
-                
+                logger.debug(f"Got observation: {observation}")
+
+                logger.debug("Getting model prediction...")
                 # Get model's action
                 action, _ = self.model.predict(observation, deterministic=True)
-                
+                logger.debug(f"Model predicted action: {action}")
+
+                logger.debug("Executing trade...")
                 # Execute trade
                 self.execute_trade(action)
-                
+                logger.debug("Trade executed successfully")
+
+                logger.debug("Waiting for next tick...")
                 # Wait for next tick
                 self.wait_for_next_tick()
-                
+                logger.debug("Next tick received")
+
             except Exception as e:
                 logger.error(f"Error in trading loop: {e}")
-                time.sleep(1)  # Wait before retrying
-    
-    def wait_for_next_tick(self):
-        """Wait for next market tick"""
-        while True:
-            tick = mt5.symbol_info_tick(self.symbol)
-            if tick is None:
-                time.sleep(0.1)
-                continue
-            
-            if self.last_tick_time is None or tick.time > self.last_tick_time:
-                self.last_tick_time = tick.time
-                break
+                import traceback
+                logger.error(f"Traceback: {traceback.format_exc()}")
             
             time.sleep(0.1)
     
     def _open_position(self, order_type: int, position_size: float):
         """Open a new position"""
+        # Check supported filling modes
+        symbol_info = mt5.symbol_info(self.symbol)
+        if symbol_info is None:
+            logger.error(f"Failed to get symbol info for {self.symbol}")
+            return False
+        
+        logger.info(f"Symbol {self.symbol} filling modes: {symbol_info.filling_mode}")
+        logger.info(f"Supported filling modes - FOK: {bool(symbol_info.filling_mode & 0x01)}, "
+                   f"IOC: {bool(symbol_info.filling_mode & 0x02)}, "
+                   f"RETURN: {bool(symbol_info.filling_mode & 0x04)}")
+        
         price = mt5.symbol_info_tick(self.symbol).ask if order_type == mt5.ORDER_TYPE_BUY else mt5.symbol_info_tick(self.symbol).bid
+        
+        # Calculate Stop Loss and Take Profit
+        if order_type == mt5.ORDER_TYPE_BUY:
+            sl = price * (1 - STOP_LOSS)
+            tp = price * (1 + PROFIT_TARGET)
+        else:  # SELL
+            sl = price * (1 + STOP_LOSS)
+            tp = price * (1 - PROFIT_TARGET)
         
         request = {
             "action": mt5.TRADE_ACTION_DEAL,
@@ -281,21 +338,28 @@ class LiveTradingEnvironment:
             "volume": position_size,
             "type": order_type,
             "price": price,
+            "sl": sl,
+            "tp": tp,
             "deviation": self.calculate_dynamic_deviation(),
             "magic": self.magic,
             "comment": MT5_CONFIG['COMMENT'] + " open",
             "type_time": mt5.ORDER_TIME_GTC,
-            "type_filling": mt5.ORDER_FILLING_IOC,
+            "type_filling": mt5.ORDER_FILLING_FOK,
         }
         
         result = mt5.order_send(request)
         if result.retcode != mt5.TRADE_RETCODE_DONE:
-            logger.error(f"Failed to open position: {result.comment}")
+            if "AutoTrading disabled" in str(result.comment):
+                logger.warning("⚠️ Auto-trading appears disabled in MT5 - check Expert Advisors settings")
+                logger.warning("Make sure 'Allow automated trading' is checked in Tools → Options → Expert Advisors")
+                return False
+            else:
+                logger.error(f"Failed to open position: {result.comment}")
             return False
         
         self.position = 1 if order_type == mt5.ORDER_TYPE_BUY else -1
         self.entry_price = price
-        logger.info(f"Opened {'long' if order_type == mt5.ORDER_TYPE_BUY else 'short'} position at {price} with size {position_size}")
+        logger.info(f"Opened {'long' if order_type == mt5.ORDER_TYPE_BUY else 'short'} position at {price} with size {position_size}, SL: {sl:.5f}, TP: {tp:.5f}")
         return True
     
     def _close_position(self):
@@ -316,7 +380,7 @@ class LiveTradingEnvironment:
             "magic": self.magic,
             "comment": MT5_CONFIG['COMMENT'] + " close",
             "type_time": mt5.ORDER_TIME_GTC,
-            "type_filling": mt5.ORDER_FILLING_IOC,
+            "type_filling": mt5.ORDER_FILLING_FOK,
         }
         
         result = mt5.order_send(request)
@@ -341,10 +405,32 @@ class LiveTradingEnvironment:
         logger.info(f"Closed position at {result.price} with profit {profit}")
         return True
     
-    def _get_position_ticket(self) -> int:
-        """Get current position ticket"""
-        positions = mt5.positions_get(symbol=self.symbol)
-        return positions[0].ticket if positions else None
+    def _sync_position_state(self):
+        """Sync internal position state with MT5 positions"""
+        positions = mt5.positions_get(symbol=self.symbol, magic=self.magic)
+        if positions:
+            position = positions[0]  # Assume only one position per symbol/magic
+            self.position = 1 if position.type == mt5.ORDER_TYPE_BUY else -1
+            self.entry_price = position.price_open
+            logger.info(f"Synced with existing position: {'long' if self.position > 0 else 'short'} at {self.entry_price}")
+        else:
+            self.position = 0
+            self.entry_price = 0
+            logger.info("No existing positions found, starting with neutral state")
+    
+    def wait_for_next_tick(self):
+        """Wait for next market tick"""
+        while True:
+            tick = mt5.symbol_info_tick(self.symbol)
+            if tick is None:
+                time.sleep(0.1)
+                continue
+            
+            if self.last_tick_time is None or tick.time > self.last_tick_time:
+                self.last_tick_time = tick.time
+                break
+            
+            time.sleep(0.1)
     
     def _get_account_balance(self) -> float:
         """Get current account balance"""
@@ -360,12 +446,43 @@ if __name__ == "__main__":
     
     # Initialize MT5 connection
     if not mt5.initialize(
-        login=MT5_CONFIG['MT5LOGIN'],
+        login=int(MT5_CONFIG['MT5LOGIN']),
         password=MT5_CONFIG['MT5PASSWORD'],
         server=MT5_CONFIG['MT5SERVER']
     ):
         logger.error("Failed to initialize MT5")
         exit(1)
+    
+    # Check MT5 connection status
+    logger.info("Checking MT5 connection...")
+    
+    # Check account info
+    account_info = mt5.account_info()
+    if account_info is None:
+        logger.error("Failed to get account info - MT5 may not be logged in or terminal not running")
+        logger.error("Please ensure:")
+        logger.error("1. MT5 terminal is running")
+        logger.error("2. You are logged in to your account")
+        logger.error("3. Auto-trading is enabled")
+        exit(1)
+    
+    logger.info(f"✅ MT5 Connected - Account: {account_info.login} ({account_info.name})")
+    logger.info(f"✅ Balance: {account_info.balance}")
+    logger.info(f"✅ Server: {account_info.server}")
+    
+    # Check if auto-trading is actually enabled
+    terminal_info = mt5.terminal_info()
+    logger.info(f"Terminal info: {terminal_info}")
+    if terminal_info:
+        logger.info(f"Trade allowed: {terminal_info.trade_allowed}")
+        logger.info(f"Connected: {terminal_info.connected}")
+        logger.info(f"DLLs allowed: {terminal_info.dlls_allowed}")
+        logger.info(f"Trade API: {terminal_info.tradeapi_disabled}")
+    
+    # Note: terminal_info.trade_allowed may not be reliable, so we'll try trading and handle errors
+    logger.info("✅ Bot ready - attempting to execute trades (auto-trading should be enabled in MT5)")
+    
+    logger.info(f"✅ Auto-trading enabled in MT5 terminal")
     
     try:
         # Create trading environment

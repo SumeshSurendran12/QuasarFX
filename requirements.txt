@@ -1,15 +1,16 @@
 # Core dependencies
 pandas==2.3.0              # pandas-dev
-numpy==1.26.4              # numpy team — downgraded to match working version
+numpy==1.26.4              # numpy team
 scikit-learn==1.7.0        # scikit-learn developers
 seaborn==0.13.2            # Michael Waskom and contributors
 wandb==0.20.1              # Weights & Biases, Inc.
 # MetaTrader5==5.0.5120  isnt supported by WSL     # MetaQuotes Software Corp. (Windows only, Python 3.7–3.11)
 python-dotenv==1.1.0       # Saurabh Kumar
 
-# Deep learning dependencies (Tested with DirectML for AMD GPUs, e.g., RX 6700, on Python 3.10)
-torch==2.0.0               # PyTorch (Meta AI)
-torch-directml==0.2.0.dev230426   # Microsoft (DirectML)
+# Deep learning dependencies (CUDA for Nvidia GPUs, e.g., RTX 3070)
+torch==2.5.1+cu121 --index-url https://download.pytorch.org/whl/cu121  # PyTorch with CUDA 12.1
+torchvision==0.20.1+cu121 --index-url https://download.pytorch.org/whl/cu121  # For image processing
+torchaudio==2.5.1+cu121 --index-url https://download.pytorch.org/whl/cu121  # Optional
 
 # Optional/other dependencies
 mypy==1.16.1               # Jukka Lehtosalo and contributors
@@ -38,4 +39,4 @@ pytz==2023.3
 lxml==4.9.3
 
 # Data API
-dukascopy-python==4.0.1    # Dukascopy data downloader (updated from Cursor env)
+dukascopy-python==4.0.1    # Dukascopy data downloader
