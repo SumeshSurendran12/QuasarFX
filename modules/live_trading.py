@@ -24,6 +24,9 @@ class LiveTradingEnvironment:
         self.last_tick_time = None
         self.trade_history = []
         self.position_size = MIN_POSITION_SIZE  # Start with minimum position size
+        self.last_action = None
+        self.last_action_log = 0.0
+        self.action_log_interval = 30.0
         
         # Generate unique magic number for this bot instance
         import random
@@ -234,10 +237,25 @@ class LiveTradingEnvironment:
         
         # Ensure position size stays within bounds
         return np.clip(position_size, MIN_POSITION_SIZE, MAX_POSITION_SIZE)
-    
+
+    def _get_symbol_positions(self):
+        """Get all open positions for the symbol (FIFO safe)."""
+        positions = mt5.positions_get(symbol=self.symbol)
+        return list(positions) if positions else []
+
     def execute_trade(self, action: int):
         """Execute trading action based on model decision"""
         current_price = mt5.symbol_info_tick(self.symbol).ask
+
+        # Refresh current position state from MT5 (FIFO/no-hedge safe)
+        positions = self._get_symbol_positions()
+        if positions:
+            oldest = min(positions, key=lambda p: p.time)
+            self.position = 1 if oldest.type == mt5.ORDER_TYPE_BUY else -1
+            self.entry_price = oldest.price_open
+        else:
+            self.position = 0
+            self.entry_price = 0
         
         # Hold
         if action == 0:
@@ -246,28 +264,84 @@ class LiveTradingEnvironment:
         # Buy
         elif action == 1 and self.position <= 0:
             if self.position < 0:
-                self._close_position()
-            
+                # FIFO/hedging-safe: close first, then wait for next tick to open
+                closed = self._close_position()
+                if closed:
+                    logger.info("Closed short; will wait before opening long.")
+                return
+
             # Update position size based on win rate
             self.position_size = self._calculate_position_size()
-            
+
             # Open long position with calculated size
             self._open_position(mt5.ORDER_TYPE_BUY, self.position_size)
+        elif action == 1 and self.position > 0:
+            logger.info("Action BUY ignored (already long)")
         
         # Sell
         elif action == 2 and self.position >= 0:
             if self.position > 0:
-                self._close_position()
-            
+                # FIFO/hedging-safe: close first, then wait for next tick to open
+                closed = self._close_position()
+                if closed:
+                    logger.info("Closed long; will wait before opening short.")
+                return
+
             # Update position size based on win rate
             self.position_size = self._calculate_position_size()
-            
+
             # Open short position with calculated size
             self._open_position(mt5.ORDER_TYPE_SELL, self.position_size)
+        elif action == 2 and self.position < 0:
+            logger.info("Action SELL ignored (already short)")
         
         # Close
         elif action == 3 and self.position != 0:
             self._close_position()
+        elif action == 3 and self.position == 0:
+            logger.info("Action CLOSE ignored (no open position)")
+
+    def _check_profit_targets(self):
+        """Check profit/stop thresholds based on entry price and current price."""
+        positions = self._get_symbol_positions()
+        if not positions:
+            self.position = 0
+            self.entry_price = 0
+            return False, None, None
+        oldest = min(positions, key=lambda p: p.time)
+        self.position = 1 if oldest.type == mt5.ORDER_TYPE_BUY else -1
+        self.entry_price = oldest.price_open
+        if self.entry_price == 0:
+            return False, None, None
+        tick = mt5.symbol_info_tick(self.symbol)
+        if tick is None:
+            return False, None, None
+
+        current_price = tick.bid if self.position > 0 else tick.ask
+        if self.position > 0:
+            loss_price = self.entry_price * (1 - STOP_LOSS)
+            profit_price = self.entry_price * (1 + PROFIT_TARGET)
+            if current_price <= loss_price:
+                return True, "stop_loss", current_price
+            if current_price >= profit_price:
+                return True, "take_profit", current_price
+        else:
+            loss_price = self.entry_price * (1 + STOP_LOSS)
+            profit_price = self.entry_price * (1 - PROFIT_TARGET)
+            if current_price >= loss_price:
+                return True, "stop_loss", current_price
+            if current_price <= profit_price:
+                return True, "take_profit", current_price
+        return False, None, current_price
+
+    def _log_action(self, action: int, price: float):
+        now = time.time()
+        if self.last_action is None or action != self.last_action or (now - self.last_action_log) >= self.action_log_interval:
+            action_names = {0: "HOLD", 1: "BUY", 2: "SELL", 3: "CLOSE"}
+            name = action_names.get(action, f"UNKNOWN({action})")
+            logger.info(f"Action: {name} | position={self.position} | price={price:.5f}")
+            self.last_action = action
+            self.last_action_log = now
     
     def run(self, max_duration_seconds: int = 1800):
         """Main trading loop"""
@@ -281,6 +355,15 @@ class LiveTradingEnvironment:
                 if elapsed >= max_duration_seconds:
                     logger.info(f"Max trading duration ({max_duration_seconds} seconds) reached. Stopping.")
                     break
+
+                # Auto-close based on profit/stop thresholds
+                should_close, reason, price = self._check_profit_targets()
+                if should_close:
+                    logger.info(f"Auto-close triggered ({reason}) at {price:.5f}")
+                    self._close_position()
+                    self.wait_for_next_tick()
+                    time.sleep(0.1)
+                    continue
                 
                 logger.debug("Getting observation...")
                 # Get current market state
@@ -290,7 +373,12 @@ class LiveTradingEnvironment:
                 logger.debug("Getting model prediction...")
                 # Get model's action
                 action, _ = self.model.predict(observation, deterministic=True)
-                logger.debug(f"Model predicted action: {action}")
+                action_arr = np.asarray(action)
+                if action_arr.size == 1:
+                    action = int(action_arr.item())
+                else:
+                    action = int(action_arr.reshape(-1)[0])
+                self._log_action(action, float(observation[3]))
 
                 logger.debug("Executing trade...")
                 # Execute trade
@@ -363,12 +451,14 @@ class LiveTradingEnvironment:
         return True
     
     def _close_position(self):
-        """Close current position"""
-        ticket = self._get_position_ticket()
-        if ticket is None:
+        """Close a position (FIFO-safe)."""
+        positions = mt5.positions_get(symbol=self.symbol)
+        if not positions:
             return False
-        
-        position = mt5.positions_get(ticket=ticket)[0]
+
+        # FIFO: close the oldest open position for this symbol
+        position = min(positions, key=lambda p: p.time)
+        ticket = position.ticket
         request = {
             "action": mt5.TRADE_ACTION_DEAL,
             "symbol": self.symbol,
@@ -404,15 +494,22 @@ class LiveTradingEnvironment:
         self.entry_price = 0
         logger.info(f"Closed position at {result.price} with profit {profit}")
         return True
+
+    def _get_position_ticket(self):
+        """Get the current position ticket for this bot instance."""
+        positions = mt5.positions_get(symbol=self.symbol, magic=self.magic)
+        if positions:
+            return positions[0].ticket
+        return None
     
     def _sync_position_state(self):
         """Sync internal position state with MT5 positions"""
-        positions = mt5.positions_get(symbol=self.symbol, magic=self.magic)
+        positions = self._get_symbol_positions()
         if positions:
-            position = positions[0]  # Assume only one position per symbol/magic
-            self.position = 1 if position.type == mt5.ORDER_TYPE_BUY else -1
-            self.entry_price = position.price_open
-            logger.info(f"Synced with existing position: {'long' if self.position > 0 else 'short'} at {self.entry_price}")
+            oldest = min(positions, key=lambda p: p.time)
+            self.position = 1 if oldest.type == mt5.ORDER_TYPE_BUY else -1
+            self.entry_price = oldest.price_open
+            logger.info(f"Synced with existing position (FIFO oldest): {'long' if self.position > 0 else 'short'} at {self.entry_price}")
         else:
             self.position = 0
             self.entry_price = 0

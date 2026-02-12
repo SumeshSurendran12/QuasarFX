@@ -3,6 +3,12 @@ Main training script for the Forex Trading Bot
 """
 
 import logging
+import os
+import sys
+import atexit
+import signal
+import socket
+import getpass
 from datetime import datetime, timedelta
 from pathlib import Path
 import time
@@ -32,7 +38,12 @@ from config import (
     PPO_PARAMS,
     PPO_VERBOSE,
     EPISODE_LENGTH,
-    GRID_SEARCH_PARAMS
+    GRID_SEARCH_PARAMS,
+    RESUME_FROM_BEST,
+    RESUME_FROM_PATH,
+    LOCK_FILE_ENABLED,
+    LOCK_FILE_PATH,
+    BASE_DIR
 )
 import json
 from data_fetcher import DataFetcher
@@ -92,6 +103,76 @@ else:
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# --- Training lock helpers ---
+def _pid_is_running(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
+
+def _load_lock_info(lock_path: Path):
+    try:
+        with lock_path.open("r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+def _acquire_training_lock() -> bool:
+    if not LOCK_FILE_ENABLED:
+        return True
+    lock_path = Path(LOCK_FILE_PATH)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if lock_path.exists():
+        info = _load_lock_info(lock_path)
+        existing_pid = None
+        if isinstance(info, dict):
+            existing_pid = info.get("pid")
+        if existing_pid and existing_pid != os.getpid() and _pid_is_running(int(existing_pid)):
+            logger.error(f"Training lock exists at {lock_path}. Another run (PID {existing_pid}) is active.")
+            return False
+        try:
+            lock_path.unlink()
+        except Exception as e:
+            logger.warning(f"Failed to remove stale lock file {lock_path}: {e}")
+
+    lock_info = {
+        "pid": os.getpid(),
+        "start_time": datetime.now().isoformat(),
+        "host": socket.gethostname(),
+        "user": getpass.getuser(),
+        "cmd": " ".join(sys.argv),
+    }
+    try:
+        lock_path.write_text(json.dumps(lock_info, indent=2), encoding="utf-8")
+    except Exception as e:
+        logger.warning(f"Failed to write lock file {lock_path}: {e}")
+        return True
+
+    def _cleanup_lock():
+        try:
+            if lock_path.exists():
+                lock_path.unlink()
+        except Exception:
+            pass
+
+    atexit.register(_cleanup_lock)
+
+    def _handle_signal(signum, frame):
+        _cleanup_lock()
+        raise SystemExit(0)
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            signal.signal(sig, _handle_signal)
+        except Exception:
+            pass
+
+    return True
+
 # Define reward shaping configuration
 DEFAULT_REWARD_CONFIG = {
     "weekly_trade_bonus": 0.0,
@@ -102,10 +183,10 @@ DEFAULT_REWARD_CONFIG = {
 
 # Model selection configuration (tune these for higher-quality search)
 MODEL_SELECTION_ENABLED = True
-MODEL_SELECTION_TRIALS = 6
-MODEL_SELECTION_SEEDS = [0, 1, 2]
-MODEL_SELECTION_TIMESTEPS = max(20000, MAX_TIMESTEPS // 5)
-FINAL_TRAIN_SEEDS = [0, 1, 2]
+MODEL_SELECTION_TRIALS = 2
+MODEL_SELECTION_SEEDS = [0]
+MODEL_SELECTION_TIMESTEPS = 50000
+FINAL_TRAIN_SEEDS = [0, 1]
 VAL_FRACTION = 0.1
 TEST_FRACTION = 0.1
 
@@ -324,12 +405,32 @@ def get_base_env(env):
         env = env.env
     return env
 
+class TrainingProgressTracker:
+    def __init__(self, total_main, total_all, selection_total=0):
+        self.total_main = int(total_main)
+        self.total_all = int(total_all)
+        self.selection_total = int(selection_total)
+        self.completed_steps = 0
+
+    def snapshot(self, current_steps):
+        global_done = self.completed_steps + int(current_steps)
+        done_main = max(global_done - self.selection_total, 0)
+        selection_remaining = max(self.selection_total - global_done, 0)
+        remaining_main = max(self.total_main - done_main, 0)
+        remaining_to_final = selection_remaining + remaining_main
+        remaining_total = max(self.total_all - global_done, 0)
+        return global_done, done_main, remaining_to_final, remaining_total
+
+    def advance(self, steps):
+        self.completed_steps += max(int(steps), 0)
+
 class ProgressCallback(BaseCallback):
-    def __init__(self, debug_logger, initial_balance=10000, update_interval=60, verbose=0):
+    def __init__(self, debug_logger, initial_balance=10000, update_interval=60, total_timesteps=None, progress_tracker=None, verbose=0):
         super().__init__(verbose)
         self.debug_logger = debug_logger
         self.initial_balance = initial_balance
         self.update_interval = update_interval
+        self.total_timesteps = total_timesteps
         self.last_update = time.time()
         self.episode_rewards = []
         self.episode_lengths = []
@@ -342,6 +443,10 @@ class ProgressCallback(BaseCallback):
         self.best_model_path = None
         self.monthly_performance = {}
         self.current_month = None
+        self.last_step_time = time.time()
+        self.last_step_count = 0
+        self.steps_per_sec = 0.0
+        self.progress_tracker = progress_tracker
 
     def _calculate_trade_stats(self, trade_history):
         """Calculate trade statistics"""
@@ -406,7 +511,7 @@ class ProgressCallback(BaseCallback):
     def save_model(self, model, episode, reward, is_best=False):
         """Save model checkpoint"""
         # Create models directory if it doesn't exist
-        models_dir = Path("models")
+        models_dir = BASE_DIR / "models"
         models_dir.mkdir(exist_ok=True)
 
         # Save regular checkpoint
@@ -430,6 +535,27 @@ class ProgressCallback(BaseCallback):
             metadata_path = models_dir / "best_model_metadata.json"
             with open(metadata_path, 'w') as f:
                 json.dump(metadata, f, indent=4)
+            
+            # Log best model to W&B as an artifact (safe if W&B is not initialized)
+            try:
+                if wandb.run is not None:
+                    run_id = getattr(wandb.run, "id", "unknown")
+                    run_name = getattr(wandb.run, "name", "unknown")
+                    artifact = wandb.Artifact(
+                        "best_model",
+                        type="model",
+                        metadata={
+                            "episode": episode,
+                            "reward": reward,
+                            "run_id": run_id,
+                            "run_name": run_name
+                        }
+                    )
+                    artifact.add_file(str(best_model_path))
+                    artifact.add_file(str(metadata_path))
+                    wandb.log_artifact(artifact, aliases=["best", "latest", f"run-{run_id}"])
+            except Exception as e:
+                logger.warning(f"wandb artifact logging failed: {e}")
 
     def _on_step(self):
         """Called at each step during training"""
@@ -457,6 +583,13 @@ class ProgressCallback(BaseCallback):
         # Update only if enough time has passed
         if current_time - self.last_update >= self.update_interval:
             self.last_update = current_time
+            # Compute steps/sec over the last interval
+            step_delta = self.n_calls - self.last_step_count
+            time_delta = current_time - self.last_step_time
+            if time_delta > 0:
+                self.steps_per_sec = step_delta / time_delta
+            self.last_step_time = current_time
+            self.last_step_count = self.n_calls
             
             # Get current episode info - use EPISODE_LENGTH from config instead of max_steps
             episode = self.episode_count
@@ -472,6 +605,21 @@ class ProgressCallback(BaseCallback):
             if hasattr(env, 'trade_history'):
                 self.trade_history = env.trade_history
             
+            eta_seconds = None
+            if self.total_timesteps is not None and self.steps_per_sec > 0:
+                remaining = max(self.total_timesteps - self.n_calls, 0)
+                eta_seconds = remaining / self.steps_per_sec
+
+            global_done = None
+            done_main = None
+            eta_to_final_stage_hours = None
+            eta_to_full_completion_hours = None
+            if self.progress_tracker is not None:
+                global_done, done_main, remaining_to_final, remaining_total = self.progress_tracker.snapshot(self.n_calls)
+                if self.steps_per_sec > 0:
+                    eta_to_final_stage_hours = remaining_to_final / self.steps_per_sec / 3600
+                    eta_to_full_completion_hours = remaining_total / self.steps_per_sec / 3600
+            
             # Calculate trade statistics
             trade_stats = self._calculate_trade_stats(self.trade_history)
                 
@@ -482,11 +630,12 @@ class ProgressCallback(BaseCallback):
             self.debug_logger.log_training_progress(
                 episode=episode,
                 timesteps=self.n_calls,
-                speed=0,  # Will be calculated if needed
+                speed=self.steps_per_sec,
                 env_info={
                     'balance': self.initial_balance + episode_reward,
                     'position_size': 0.15,  # Fixed position size
                     'weekly_trades': trade_stats['total_trades'],
+                    'eta_seconds': eta_seconds,
                     'metrics': {
                         'net_profit': episode_reward,
                         'win_rate': trade_stats['win_rate'],
@@ -494,6 +643,17 @@ class ProgressCallback(BaseCallback):
                     }
                 }
             )
+
+            if self.progress_tracker is not None:
+                print(f"steps/sec: {self.steps_per_sec:.1f}", flush=True)
+                print(f"main_done: {done_main:,} / {self.progress_tracker.total_main:,}", flush=True)
+                print(f"total_done: {global_done:,} / {self.progress_tracker.total_all:,}", flush=True)
+                if eta_to_final_stage_hours is not None:
+                    print(f"eta_to_final_stage_hours: {eta_to_final_stage_hours:.2f}", flush=True)
+                    print(f"eta_to_full_completion_hours: {eta_to_full_completion_hours:.2f}", flush=True)
+                else:
+                    print("eta_to_final_stage_hours: n/a", flush=True)
+                    print("eta_to_full_completion_hours: n/a", flush=True)
             
             # Save model if it's the best so far
             if self.last_episode_reward is not None and self.last_episode_reward > self.best_reward:
@@ -505,17 +665,32 @@ class ProgressCallback(BaseCallback):
                 self.save_model(self.model, episode, self.last_episode_reward)
             
             # Log to wandb
-            wandb.log({
+            wandb_payload = {
                 'episode': episode,
                 'reward': episode_reward,
                 'avg_reward': avg_reward,
                 'avg_length': avg_length,
                 'win_rate': trade_stats['win_rate'],
                 'profit_factor': trade_stats['profit_factor'],
-                'total_trades': trade_stats['total_trades']
-            })
+                'total_trades': trade_stats['total_trades'],
+                'steps_per_sec': self.steps_per_sec,
+                'eta_seconds': eta_seconds if eta_seconds is not None else 0
+            }
+            if self.progress_tracker is not None and global_done is not None and done_main is not None:
+                wandb_payload.update({
+                    'main_done': done_main,
+                    'total_done': global_done,
+                    'total_all': self.progress_tracker.total_all,
+                    'eta_to_final_stage_hours': eta_to_final_stage_hours if eta_to_final_stage_hours is not None else 0,
+                    'eta_to_full_completion_hours': eta_to_full_completion_hours if eta_to_full_completion_hours is not None else 0
+                })
+            wandb.log(wandb_payload)
 
         return True
+
+    def _on_training_end(self):
+        if self.progress_tracker is not None:
+            self.progress_tracker.advance(self.n_calls)
     
     def _calculate_monthly_performance(self):
         """Calculate monthly performance metrics"""
@@ -709,6 +884,15 @@ def _build_model(env, hyperparams=None, verbose_override=None):
     )
     return model
 
+def _load_or_build_model(env, hyperparams=None, verbose_override=None, allow_resume=False):
+    resume_path = Path(RESUME_FROM_PATH)
+    if allow_resume and RESUME_FROM_BEST and resume_path.exists():
+        if hyperparams:
+            logger.warning("Resuming from best checkpoint; ignoring new hyperparameters for this run.")
+        logger.info(f"Resuming training from {resume_path}")
+        return PPO.load(str(resume_path), env=env, device=DEVICE)
+    return _build_model(env, hyperparams=hyperparams, verbose_override=verbose_override)
+
 def _hyperparams_valid(hyperparams):
     n_steps = hyperparams.get('n_steps', N_STEPS)
     batch_size = hyperparams.get('batch_size', BATCH_SIZE)
@@ -785,8 +969,18 @@ def run_model_selection(train_df, val_df):
     logger.info(f"Best hyperparameters from selection: {best_params}")
     return best_params or {}
 
+def _compute_progress_totals():
+    selection_total = 0
+    if MODEL_SELECTION_ENABLED:
+        selection_total = MODEL_SELECTION_TRIALS * len(MODEL_SELECTION_SEEDS) * MODEL_SELECTION_TIMESTEPS
+    total_all = selection_total + MAX_TIMESTEPS * (1 + len(FINAL_TRAIN_SEEDS))
+    return selection_total, total_all
+
 def train():
     """Main training function"""
+    if not _acquire_training_lock():
+        logger.error("Exiting: another training run is already active.")
+        return
     # Initialize wandb
     wandb.init(project="forex-trading-bot", config={
         'algorithm': 'PPO',
@@ -802,6 +996,13 @@ def train():
     
     # Create debug logger
     debug_logger = DebugLogger()
+
+    selection_total, total_all = _compute_progress_totals()
+    progress_tracker = TrainingProgressTracker(
+        total_main=MAX_TIMESTEPS,
+        total_all=total_all,
+        selection_total=selection_total
+    )
 
     # Load historical data before environment creation
     fetcher = DataFetcher()
@@ -819,22 +1020,32 @@ def train():
     selected_params = {}
     if MODEL_SELECTION_ENABLED:
         selected_params = run_model_selection(train_df, val_df)
+        if selection_total > 0:
+            progress_tracker.advance(selection_total)
 
     # Create vectorized environment
     train_full_df = pd.concat([train_df, val_df]).copy()
     env = DummyVecEnv([make_env(i, train_full_df, reward_config=REWARD_SHAPING) for i in range(1)])
 
-    # Create model
-    model = _build_model(env, hyperparams=selected_params)
+    # Create or resume model
+    model = _load_or_build_model(env, hyperparams=selected_params, allow_resume=True)
 
     # Create callbacks
-    progress_callback = ProgressCallback(debug_logger)
-    lr_monitor = LearningRateMonitor()
+    def _make_callbacks(total_timesteps):
+        return [
+            ProgressCallback(
+                debug_logger,
+                update_interval=10,
+                total_timesteps=total_timesteps,
+                progress_tracker=progress_tracker
+            ),
+            LearningRateMonitor()
+        ]
     
     # Train model
     model.learn(
             total_timesteps=MAX_TIMESTEPS,
-        callback=[progress_callback, lr_monitor]
+        callback=_make_callbacks(MAX_TIMESTEPS)
         )
 
     # Evaluate on out-of-sample data (test set)
@@ -842,15 +1053,15 @@ def train():
 
     # Train additional seeds for robustness and select best on test set
     best_score = float('-inf')
-    best_model_path = Path("models") / "best_model.zip"
-    best_metadata_path = Path("models") / "best_model_metadata.json"
+    best_model_path = BASE_DIR / "models" / "best_model.zip"
+    best_metadata_path = BASE_DIR / "models" / "best_model_metadata.json"
     for seed in FINAL_TRAIN_SEEDS:
         candidate_model, candidate_env = _train_single_model(
             train_df=train_full_df,
             seed=seed,
             hyperparams=selected_params,
             timesteps=MAX_TIMESTEPS,
-            callbacks=[progress_callback, lr_monitor]
+            callbacks=_make_callbacks(MAX_TIMESTEPS)
         )
         metrics = evaluate_model(candidate_model, test_df, tag=f"test_seed{seed}")
         score = _selection_score(metrics)
@@ -867,8 +1078,40 @@ def train():
         candidate_env.close()
         del candidate_model
 
-        # Save final model
-    model.save("models/final_model")
+    # Ensure best model is logged to W&B as an artifact (safe if W&B is not initialized)
+    try:
+        if wandb.run is not None and best_model_path.exists():
+            run_id = getattr(wandb.run, "id", "unknown")
+            run_name = getattr(wandb.run, "name", "unknown")
+            best_artifact = wandb.Artifact(
+                "best_model",
+                type="model",
+                metadata={"run_id": run_id, "run_name": run_name}
+            )
+            best_artifact.add_file(str(best_model_path))
+            if best_metadata_path.exists():
+                best_artifact.add_file(str(best_metadata_path))
+            wandb.log_artifact(best_artifact, aliases=["best", "latest", f"run-{run_id}"])
+    except Exception as e:
+        logger.warning(f"wandb best artifact logging failed: {e}")
+
+    # Save final model
+    final_model_path = BASE_DIR / "models" / "final_model.zip"
+    model.save(str(final_model_path))
+    # Log final model to W&B as an artifact (safe if W&B is not initialized)
+    try:
+        if wandb.run is not None:
+            run_id = getattr(wandb.run, "id", "unknown")
+            run_name = getattr(wandb.run, "name", "unknown")
+            final_artifact = wandb.Artifact(
+                "final_model",
+                type="model",
+                metadata={"run_id": run_id, "run_name": run_name}
+            )
+            final_artifact.add_file(str(final_model_path))
+            wandb.log_artifact(final_artifact, aliases=["final", "latest", f"run-{run_id}"])
+    except Exception as e:
+        logger.warning(f"wandb final artifact logging failed: {e}")
     
     # Close wandb
     wandb.finish()

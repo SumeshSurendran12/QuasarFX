@@ -101,6 +101,16 @@ class DebugLogger:
         self.logger.info(f"Current Episode: {episode}")
         self.logger.info(f"Timesteps: {timesteps}")
         self.logger.info(f"Speed: {speed:.1f} steps/s")
+        if env_info and 'eta_seconds' in env_info and env_info['eta_seconds'] is not None:
+            try:
+                eta_seconds = float(env_info['eta_seconds'])
+                if eta_seconds >= 0:
+                    hours = int(eta_seconds // 3600)
+                    minutes = int((eta_seconds % 3600) // 60)
+                    seconds = int(eta_seconds % 60)
+                    self.logger.info(f"ETA: {hours:02d}:{minutes:02d}:{seconds:02d}")
+            except Exception:
+                pass
         self.logger.info(f"Current Episode P&L: ${self.training_stats['pnl']:.2f}")
         self.logger.info(f"Current Balance: ${self.training_stats['current_balance']:.2f}")
         self.logger.info(f"Win Rate: {self.training_stats['win_rate']:.1f}%")

@@ -3,7 +3,7 @@ pandas==2.3.0              # pandas-dev
 numpy==1.26.4              # numpy team
 scikit-learn==1.7.0        # scikit-learn developers
 seaborn==0.13.2            # Michael Waskom and contributors
-wandb==0.20.1              # Weights & Biases, Inc.
+wandb>=0.20.1              # Weights & Biases, Inc. (new API keys supported in newer versions)
 # MetaTrader5==5.0.5120  isnt supported by WSL     # MetaQuotes Software Corp. (Windows only, Python 3.7–3.11)
 python-dotenv==1.1.0       # Saurabh Kumar
 

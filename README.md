@@ -161,6 +161,60 @@ MT5_SERVER=your_broker_server
    python test_directml.py
    ```
 
+
+## Lambda Labs H100 SXM Quick Setup (Sticky Steps 1-3)
+
+Step 1 - Fix permissions + create venv (run on the SXM VM)
+```bash
+cd ~/forex-trading-bot
+sudo chown -R ubuntu:ubuntu .
+sudo chmod -R u+rwX .
+sudo rm -rf .venv
+
+sudo apt update
+sudo apt install -y python3.11 python3.11-venv
+
+python3.11 -m venv .venv
+source .venv/bin/activate
+python -V
+```
+You should see Python 3.11.x and the prompt should show (.venv).
+
+Step 2 - Re-copy modules/ from your Windows machine
+Run this on Windows PowerShell:
+```powershell
+scp -i "$env:USERPROFILE\.ssh\lambda_a100" -r "C:\Users\sumes\OneDrive - UTHealth Houston\Desktop\FX\Forex-trading-bot\modules" ubuntu@192.222.55.197:~/forex-trading-bot/
+```
+Short note: Step 3 will fail if `requirements.txt` is missing. Copy it once:
+```powershell
+scp -i "$env:USERPROFILE\.ssh\lambda_a100" "C:\Users\sumes\OneDrive - UTHealth Houston\Desktop\FX\Forex-trading-bot\requirements.txt" ubuntu@192.222.55.197:~/forex-trading-bot/
+```
+Then on the VM:
+```bash
+ls ~/forex-trading-bot/modules
+```
+You should see `data_fetcher.py`, `main.py`, etc.
+
+Step 3 - Install deps inside the venv (on VM)
+```bash
+cd ~/forex-trading-bot
+python -m pip install -U pip
+
+pip install torch==2.5.1+cu121 torchvision==0.20.1+cu121 torchaudio==2.5.1+cu121 --index-url https://download.pytorch.org/whl/cu121
+grep -vE '^(torch|torchvision|torchaudio)' requirements.txt | pip install -r /dev/stdin
+```
+
+Optional Step 4 - Run the benchmark (on VM)
+```bash
+cd ~/forex-trading-bot/modules
+WANDB_MODE=disabled python benchmark.py
+```
+
+Benchmark results (20,000 timesteps, Feb 7, 2026):
+| GPU | Elapsed (sec) | Steps/sec |
+| --- | --- | --- |
+| H100 PCIe | 143.85 | 139.0 |
+| H100 SXM | 53.23 | 375.7 |
 ## Usage
 
 ### Backtesting/Training
@@ -186,6 +240,27 @@ python live_trading.py
 - After training, models are saved in the `models/` folder.
 - Update `MODEL_PATH` in `modules/config.py` to point to your trained model (e.g., `models/final_model.zip`) for live trading.
 
+**Model Backup (Local + W&B)**
+- Best and final models are saved locally on the VM in `models/`.
+- Best and final models are also logged to W&B as versioned artifacts (one version per run).
+- To download models to your PC after training, run:
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\download_models.ps1 -Host 192.222.55.197
+```
+
+**Safe Training Launcher (Prevents Duplicate Runs)**
+- Use the guard script to start training safely inside `tmux` and avoid accidental duplicates:
+```bash
+bash ./scripts/run_training.sh
+```
+- If a run is already active, it will print how to attach instead of starting a second one.
+
+**ETA Helper (Final Stage + Full Completion)**
+- Print ETA to final stage and full completion from the VM:
+```bash
+bash ./scripts/eta.sh
+```
+
 ## Performance Tracking
 
 - Real-time metrics
@@ -200,6 +275,7 @@ python live_trading.py
 - **GPU Issues**: Update AMD drivers, verify DirectML (run `python test_directml.py`), check OpenCL compatibility.
 - **MetaTrader 5**: Verify `.env` credentials, make sure MT5 is running/logged in, check server settings.
 - **Training Issues**: Confirm data files in `data/`, check system memory, monitor GPU temps.
+- **Duplicate Runs**: Training uses a lock file at `logs/train.lock` to prevent multiple concurrent runs. Delete it if you intentionally want to run more than one training job.
 
 ## Security
 

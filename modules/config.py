@@ -86,17 +86,21 @@ POSITION_SIZE_INCREMENT = 0.05  # Increment for position sizing
 MAX_TRADES_PER_WEEK = 6  # Max trades allowed per week
 MAX_DAILY_TRADES = 10  # Max trades allowed per day
 MAX_WEEKLY_TRADES = 50  # Max trades allowed per week (hard cap)
-PROFIT_TARGET = 0.03  # Profit target per trade (3% - increased for better returns)
-STOP_LOSS = 0.015  # Stop loss per trade (1.5% - increased to match risk-reward)
+PROFIT_TARGET = 0.005  # Profit target per trade (0.5%)
+STOP_LOSS = 0.0025  # Stop loss per trade (0.25%)
 
 # === 6. Training/Backtesting Parameters ===
 MAX_EPISODES = 2200000  # Maximum number of training episodes
-MAX_TIMESTEPS = 100000  # Maximum number of training timesteps (reduced for faster testing)
+MAX_TIMESTEPS = 1000000  # Maximum number of training timesteps (standard real training)
 MIN_EPISODES = 1000  # Minimum number of training episodes
 TARGET_WEEKLY_PROFIT = 1000.0  # Target profit per week in USD
 BATCH_SIZE = 32  # Training batch size
 N_STEPS = 512  # Number of steps per PPO update
 GRADIENT_ACCUMULATION_STEPS = 4  # Gradient accumulation steps
+RESUME_FROM_BEST = True  # Auto-resume from best checkpoint if it exists
+RESUME_FROM_PATH = "models/best_model.zip"  # Path for auto-resume checkpoint
+LOCK_FILE_ENABLED = True  # Prevent duplicate concurrent training runs
+LOCK_FILE_PATH = BASE_DIR / "logs" / "train.lock"  # Training lock file path
 
 # === 7. Reward Shaping ===
 REWARD_SHAPING = {
