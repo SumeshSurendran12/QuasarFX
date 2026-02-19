@@ -4,7 +4,10 @@ Logger module for the Forex Trading Bot
 
 import logging
 import os
-from config import LOG_FILE_PATH, LOGS_DIRECTORY
+try:
+    from .config import LOG_FILE_PATH, LOGS_DIRECTORY
+except ImportError:  # pragma: no cover - script mode fallback
+    from config import LOG_FILE_PATH, LOGS_DIRECTORY
 
 def setup_logger():
     

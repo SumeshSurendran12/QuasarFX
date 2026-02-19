@@ -98,7 +98,7 @@ Forex Trading Bot/
 │   ├── logger.py          # Logging utilities
 │   ├── model.py           # PPO implementation (PyTorch Lightning)
 │   ├── debug.py           # Analytics and visualization
-│   └── visualization.py   # Performance visualization
+│   └── technical_indicators.py # Indicator feature engineering
 ├── reports/               # Performance reports and charts
 ├── wandb/                 # Weights & Biases experiment tracking
 ├── .env                   # Environment variables (MT5 credentials)

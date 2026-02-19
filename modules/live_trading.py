@@ -10,12 +10,30 @@ import time
 import logging
 import pickle
 from typing import Dict, List, Tuple, Optional
-from config import MT5_CONFIG, MIN_POSITION_SIZE, MAX_POSITION_SIZE, STOP_LOSS, PROFIT_TARGET
+try:
+    from .config import MT5_CONFIG, MIN_POSITION_SIZE, MAX_POSITION_SIZE, STOP_LOSS, PROFIT_TARGET
+except ImportError:  # pragma: no cover - script mode fallback
+    from config import MT5_CONFIG, MIN_POSITION_SIZE, MAX_POSITION_SIZE, STOP_LOSS, PROFIT_TARGET
                     
 
 logger = logging.getLogger(__name__)
 
 class LiveTradingEnvironment:
+    def _ensure_mt5_connection(self):
+        """Initialize MT5 when instantiated outside the script entrypoint."""
+        terminal_info = mt5.terminal_info()
+        if terminal_info is not None and terminal_info.connected:
+            return
+
+        login = MT5_CONFIG.get('MT5LOGIN')
+        password = MT5_CONFIG.get('MT5PASSWORD')
+        server = MT5_CONFIG.get('MT5SERVER')
+        if not login or not password or not server:
+            raise RuntimeError("MT5 credentials are missing (MT5_LOGIN/MT5_PASSWORD/MT5_SERVER)")
+
+        if not mt5.initialize(login=int(login), password=password, server=server):
+            raise RuntimeError(f"Failed to initialize MT5: {mt5.last_error()}")
+
     def __init__(self, symbol: str = MT5_CONFIG['MT5SYMBOL'], timeframe: str = MT5_CONFIG['MT5TIMEFRAME'], model_path: str = MT5_CONFIG['MODEL_PATH']):
         self.symbol = symbol
         self.timeframe = timeframe
@@ -32,7 +50,8 @@ class LiveTradingEnvironment:
         import random
         self.magic = MT5_CONFIG['MAGIC_BASE'] + random.randint(1, 9999)
         
-        # MT5 should already be initialized and logged in from main
+        # If this class is used directly (e.g. ad-hoc smoke tests), initialize MT5 here.
+        self._ensure_mt5_connection()
         
         # Get symbol info
         self.symbol_info = mt5.symbol_info(symbol)
@@ -239,8 +258,8 @@ class LiveTradingEnvironment:
         return np.clip(position_size, MIN_POSITION_SIZE, MAX_POSITION_SIZE)
 
     def _get_symbol_positions(self):
-        """Get all open positions for the symbol (FIFO safe)."""
-        positions = mt5.positions_get(symbol=self.symbol)
+        """Get open positions for this bot instance (symbol + magic, FIFO safe)."""
+        positions = mt5.positions_get(symbol=self.symbol, magic=self.magic)
         return list(positions) if positions else []
 
     def execute_trade(self, action: int):
@@ -452,7 +471,7 @@ class LiveTradingEnvironment:
     
     def _close_position(self):
         """Close a position (FIFO-safe)."""
-        positions = mt5.positions_get(symbol=self.symbol)
+        positions = self._get_symbol_positions()
         if not positions:
             return False
 

@@ -3,16 +3,24 @@ Data fetcher module for retrieving market data
 """
 
 import os
-import requests
-import pandas as pd
-from datetime import datetime, timedelta
-from typing import List, Dict, Optional, Union, Any
-import numpy as np
 import logging
-from logger import logger
-from config import SYMBOL, TIMEFRAME, YEARS, DATA_CSV_PATH
-from dukascopy_downloader import download_dukascopy_csv, download_dukascopy_range_csv
-from technical_indicators import TechnicalIndicators
+from datetime import datetime, timedelta
+from pathlib import Path
+from typing import List, Dict, Optional, Union, Any
+
+import numpy as np
+import pandas as pd
+
+try:
+    from .logger import logger as _bootstrap_logger
+    from .config import SYMBOL, TIMEFRAME, YEARS, DATA_CSV_PATH
+    from .dukascopy_downloader import download_dukascopy_csv, download_dukascopy_range_csv
+    from .technical_indicators import TechnicalIndicators
+except ImportError:  # pragma: no cover - script mode fallback
+    from logger import logger as _bootstrap_logger
+    from config import SYMBOL, TIMEFRAME, YEARS, DATA_CSV_PATH
+    from dukascopy_downloader import download_dukascopy_csv, download_dukascopy_range_csv
+    from technical_indicators import TechnicalIndicators
 
 logger = logging.getLogger(__name__)
 
@@ -36,12 +44,30 @@ def cov_to_corr(cov_matrix):
     return corr
 
 class DataFetcher:
-    def __init__(self):
-        self.symbol = SYMBOL
-        self.timeframe = TIMEFRAME
+    def __init__(self, symbol: Optional[str] = None, timeframe: Optional[str] = None):
+        self.symbol = symbol or SYMBOL
+        self.timeframe = timeframe or TIMEFRAME
         self.cache = {}
         self.cache_timeout = timedelta(minutes=5)
         self.data_csv_path = DATA_CSV_PATH
+        self.data_dir = Path(__file__).resolve().parent.parent / "data"
+
+    def _normalize_symbol_for_filename(self, symbol: str) -> List[str]:
+        safe_symbol = str(symbol).replace("/", "_").replace("\\", "_").replace(" ", "").upper()
+        compact = safe_symbol.replace("_", "")
+        variants = [safe_symbol]
+        if len(compact) == 6:
+            variants.append(f"{compact[:3]}_{compact[3:]}")
+            variants.append(compact)
+        return list(dict.fromkeys(variants))
+
+    def _find_existing_csv(self, symbol: str) -> Optional[Path]:
+        candidates: List[Path] = []
+        for variant in self._normalize_symbol_for_filename(symbol):
+            candidates.extend(self.data_dir.glob(f"{variant}_*.csv"))
+        if not candidates:
+            return None
+        return max(candidates, key=lambda path: path.stat().st_mtime)
 
     def fetch_historical_data(self, download_if_missing=False, symbol=None, timeframe=None, years: int = YEARS, add_indicators=True) -> pd.DataFrame:
         """
@@ -65,15 +91,23 @@ class DataFetcher:
         end_date = datetime.now()
         start_date = end_date - timedelta(days=years * 365)
         
-        # Always download a new file
-        logger.info(f"Downloading fresh data from Dukascopy...")
-        csv_path = download_dukascopy_range_csv(symbol, timeframe, start_date, end_date)
-        if not csv_path or not os.path.exists(csv_path):
-            logger.error(f"CSV file not found or download failed: {csv_path}")
-            raise FileNotFoundError(f"CSV file not found or download failed: {csv_path}")
-        
+        csv_path = self._find_existing_csv(symbol)
+        if csv_path is None:
+            if not download_if_missing:
+                raise FileNotFoundError(
+                    f"No historical CSV found for symbol {symbol} in {self.data_dir}. "
+                    "Set download_if_missing=True to fetch from Dukascopy."
+                )
+
+            logger.info("No local CSV found, downloading fresh data from Dukascopy...")
+            downloaded_path = download_dukascopy_range_csv(symbol, timeframe, start_date, end_date)
+            if not downloaded_path or not os.path.exists(downloaded_path):
+                logger.error(f"CSV file not found or download failed: {downloaded_path}")
+                raise FileNotFoundError(f"CSV file not found or download failed: {downloaded_path}")
+            csv_path = Path(downloaded_path)
+
+        logger.info(f"Loading historical data from {csv_path}")
         df = pd.read_csv(csv_path)
-        print("Loaded CSV columns:", df.columns.tolist())
         
         # Accept either 'time' or 'date' as the datetime column
         datetime_col = 'time' if 'time' in df.columns else 'date' if 'date' in df.columns else None
@@ -97,9 +131,7 @@ class DataFetcher:
             ti = TechnicalIndicators()
             df = ti.add_all_indicators(df, price_col='close')
             logger.info(f"Added {len(ti.get_feature_names())} technical indicators")
-            print(f"DataFrame with indicators shape: {df.shape}")
-            print(f"Available columns: {df.columns.tolist()[:10]}...")  # Show first 10 columns
-        
+
         logger.info(f"Loaded {len(df)} rows from {csv_path}")
         logger.info(f"Date range: {df.index.min()} to {df.index.max()}")
         logger.info(f"Final columns count: {len(df.columns)}")

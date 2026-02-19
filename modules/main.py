@@ -16,7 +16,7 @@ import pandas as pd
 import numpy as np
 import random
 from stable_baselines3 import PPO
-from stable_baselines3.common.vec_env import DummyVecEnv
+from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv
 from stable_baselines3.common.callbacks import BaseCallback
 from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.utils import set_random_seed
@@ -24,35 +24,92 @@ from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 import gymnasium as gym
 from gymnasium import spaces
 import wandb
-from model import TradingEnvironment
-from debug import DebugLogger
 import torch
 import torch.nn as nn
-from config import (
-    MIN_POSITION_SIZE, MAX_POSITION_SIZE, SYMBOL, TIMEFRAME, YEARS,
-    MAX_EPISODES, MAX_TIMESTEPS, MIN_EPISODES, TARGET_WEEKLY_PROFIT, MAX_TRADES_PER_WEEK,
-    BATCH_SIZE, N_STEPS,
-    REWARD_SHAPING,
-    INITIAL_LR, FINAL_LR, MIN_LR, WARMUP_STEPS,
-    DEVICE_TYPE,
-    PPO_PARAMS,
-    PPO_VERBOSE,
-    EPISODE_LENGTH,
-    GRID_SEARCH_PARAMS,
-    RESUME_FROM_BEST,
-    RESUME_FROM_PATH,
-    LOCK_FILE_ENABLED,
-    LOCK_FILE_PATH,
-    BASE_DIR
-)
 import json
-from data_fetcher import DataFetcher
+try:
+    from .model import TradingEnvironment
+    from .debug import DebugLogger
+    from .config import (
+        MIN_POSITION_SIZE, MAX_POSITION_SIZE, SYMBOL, TIMEFRAME, YEARS,
+        MAX_EPISODES, MAX_TIMESTEPS, MIN_EPISODES, TARGET_WEEKLY_PROFIT, MAX_TRADES_PER_WEEK,
+        BATCH_SIZE, N_STEPS,
+        REWARD_SHAPING,
+        INITIAL_LR, FINAL_LR, MIN_LR, WARMUP_STEPS,
+        DEVICE_TYPE,
+        PPO_PARAMS,
+        PPO_VERBOSE,
+        EPISODE_LENGTH,
+        GRID_SEARCH_PARAMS,
+        RESUME_FROM_BEST,
+        RESUME_FROM_PATH,
+        LOCK_FILE_ENABLED,
+        LOCK_FILE_PATH,
+        BASE_DIR,
+        TRAINING_PROFILE,
+        NUM_ENVS,
+        VEC_ENV_TYPE,
+        FEATURES_DIM,
+        FEATURE_EXTRACTOR_HIDDEN_DIM,
+        POLICY_NET_ARCH,
+        ENTROPY_SCHEDULE_ENABLED,
+        ENTROPY_START_COEF,
+        ENTROPY_END_COEF,
+        ENTROPY_WARMUP_FRACTION,
+        USE_CUSTOM_REWARD_WRAPPER,
+        TRAIN_RANDOM_START,
+        POSITION_BALANCE_SCALING,
+        POSITION_BALANCE_FLOOR,
+        EVAL_ACTION_SHAPING,
+    )
+    from .data_fetcher import DataFetcher
+except ImportError:  # pragma: no cover - script mode fallback
+    from model import TradingEnvironment
+    from debug import DebugLogger
+    from config import (
+        MIN_POSITION_SIZE, MAX_POSITION_SIZE, SYMBOL, TIMEFRAME, YEARS,
+        MAX_EPISODES, MAX_TIMESTEPS, MIN_EPISODES, TARGET_WEEKLY_PROFIT, MAX_TRADES_PER_WEEK,
+        BATCH_SIZE, N_STEPS,
+        REWARD_SHAPING,
+        INITIAL_LR, FINAL_LR, MIN_LR, WARMUP_STEPS,
+        DEVICE_TYPE,
+        PPO_PARAMS,
+        PPO_VERBOSE,
+        EPISODE_LENGTH,
+        GRID_SEARCH_PARAMS,
+        RESUME_FROM_BEST,
+        RESUME_FROM_PATH,
+        LOCK_FILE_ENABLED,
+        LOCK_FILE_PATH,
+        BASE_DIR,
+        TRAINING_PROFILE,
+        NUM_ENVS,
+        VEC_ENV_TYPE,
+        FEATURES_DIM,
+        FEATURE_EXTRACTOR_HIDDEN_DIM,
+        POLICY_NET_ARCH,
+        ENTROPY_SCHEDULE_ENABLED,
+        ENTROPY_START_COEF,
+        ENTROPY_END_COEF,
+        ENTROPY_WARMUP_FRACTION,
+        USE_CUSTOM_REWARD_WRAPPER,
+        TRAIN_RANDOM_START,
+        POSITION_BALANCE_SCALING,
+        POSITION_BALANCE_FLOOR,
+        EVAL_ACTION_SHAPING,
+    )
+    from data_fetcher import DataFetcher
 
 
 
 # Custom Features Extractor
 class CustomFeaturesExtractor(BaseFeaturesExtractor):
-    def __init__(self, observation_space: gym.spaces.Box, features_dim: int = 64):
+    def __init__(
+        self,
+        observation_space: gym.spaces.Box,
+        features_dim: int = FEATURES_DIM,
+        hidden_dim: int = FEATURE_EXTRACTOR_HIDDEN_DIM,
+    ):
         super().__init__(observation_space, features_dim)
         
         # Get the actual input shape from the observation space
@@ -62,11 +119,11 @@ class CustomFeaturesExtractor(BaseFeaturesExtractor):
         self.network = nn.Sequential(
             nn.Flatten(),  # Flatten the input
             nn.LayerNorm(n_input),  # Add layer normalization
-            nn.Linear(n_input, 64),
+            nn.Linear(n_input, hidden_dim),
             nn.ReLU(),
             nn.Dropout(0.1),
-            nn.LayerNorm(64),  # Add layer normalization
-            nn.Linear(64, features_dim),
+            nn.LayerNorm(hidden_dim),  # Add layer normalization
+            nn.Linear(hidden_dim, features_dim),
             nn.ReLU()
         )
         
@@ -102,6 +159,13 @@ else:
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+
+def _wandb_active() -> bool:
+    try:
+        return wandb.run is not None
+    except Exception:
+        return False
 
 # --- Training lock helpers ---
 def _pid_is_running(pid: int) -> bool:
@@ -187,6 +251,10 @@ MODEL_SELECTION_TRIALS = 2
 MODEL_SELECTION_SEEDS = [0]
 MODEL_SELECTION_TIMESTEPS = 50000
 FINAL_TRAIN_SEEDS = [0, 1]
+if TRAINING_PROFILE == "gpu_quality":
+    MODEL_SELECTION_TRIALS = 3
+    MODEL_SELECTION_TIMESTEPS = 100000
+    FINAL_TRAIN_SEEDS = [0, 1, 2]
 VAL_FRACTION = 0.1
 TEST_FRACTION = 0.1
 
@@ -296,6 +364,21 @@ class CustomRewardWrapper(gym.Wrapper):
         self.trade_history = []
         self.weekly_trade_cap = MAX_TRADES_PER_WEEK
         self.position_size = MIN_POSITION_SIZE  # Start with minimum position size
+        self.last_trade_count = 0
+
+    def _current_week_bucket(self):
+        env_dt = getattr(self.env, "current_datetime", None)
+        if env_dt is not None:
+            try:
+                ts = pd.Timestamp(env_dt)
+                iso = ts.isocalendar()
+                return int(iso.year), int(iso.week)
+            except Exception:
+                pass
+        step = int(getattr(self.env, "current_step", 0))
+        bars_per_day = int(getattr(self.env, "bars_per_day", 24))
+        bars_per_week = max(7 * bars_per_day, 1)
+        return step // bars_per_week
 
     def _calculate_position_size(self):
         """Calculate position size based on win rate"""
@@ -316,9 +399,10 @@ class CustomRewardWrapper(gym.Wrapper):
 
     def step(self, action):
         observation, reward, terminated, truncated, info = self.env.step(action)
+        reward_value = float(reward)
         
         # Get current week
-        current_week = pd.Timestamp.now().isocalendar()[1]
+        current_week = self._current_week_bucket()
         
         # Reset weekly counters if it's a new week
         if self.last_week is not None and current_week != self.last_week:
@@ -330,50 +414,44 @@ class CustomRewardWrapper(gym.Wrapper):
         self.position_size = self._calculate_position_size()
         
         # Apply position size to info
-        if action in [1, 2]:  # Buy or Sell actions
+        if int(np.asarray(action).reshape(-1)[0]) in [1, 2]:
             info['position_size'] = self.position_size
-        
-        # Update trade history
-        if action in [1, 2]:  # Buy or Sell actions
-            self.trade_history.append({
-                'action': action,
-                'reward': reward,
-                'position_size': self.position_size,
-                'timestamp': pd.Timestamp.now()
-            })
-            
-            # Update weekly trade count
-            self.weekly_trades += 1
-            
-            # Apply weekly trade cap penalty
-            if self.weekly_trades > self.weekly_trade_cap:
-                reward -= self.reward_config['weekly_trade_bonus']
-        
-        # Update win/loss streaks
-        if reward > 0: # type: ignore
-            self.win_streak += 1
-            self.loss_streak = 0
-        elif reward < 0: # type: ignore
-            # If reward is negative, it counts as a loss
-            self.loss_streak += 1
-            self.win_streak = 0
 
-        # Apply win streak bonus
-        if self.win_streak > 1:
-            reward += self.reward_config['win_streak_bonus'] * min(self.win_streak, 5)
-        
-        # Apply loss streak penalty
-        if self.loss_streak > 1:
-            reward -= self.reward_config['loss_penalty'] * min(self.loss_streak, 5)
-        
-        # Update weekly profit
-        self.weekly_profit += reward # type: ignore
-        
-        # Apply weekly profit bonus
+        env_trade_history = getattr(self.env, "trade_history", [])
+        trade_count = len(env_trade_history)
+        opened_trade = trade_count > self.last_trade_count
+        realized_pnl = float(info.get("realized_pnl", 0.0))
+        trade_executed = bool(info.get("trade_executed", False))
+
+        # Update wrapper trade history only on real trade open events.
+        if opened_trade and env_trade_history:
+            self.trade_history.append({
+                'action': int(np.asarray(action).reshape(-1)[0]),
+                'reward': float(env_trade_history[-1].get('reward', 0.0)),
+                'position_size': self.position_size,
+                'timestamp': pd.Timestamp(getattr(self.env, "current_datetime", pd.Timestamp.now()))
+            })
+            self.weekly_trades += 1
+            if self.weekly_trades > self.weekly_trade_cap:
+                reward_value -= abs(float(self.reward_config.get('weekly_trade_bonus', 0.0)))
+
+        # Reward only realized outcomes to keep objective aligned with profitability.
+        if trade_executed and realized_pnl != 0.0:
+            if realized_pnl > 0:
+                self.win_streak += 1
+                self.loss_streak = 0
+                reward_value += self.reward_config['win_streak_bonus'] * min(self.win_streak, 5)
+            else:
+                self.loss_streak += 1
+                self.win_streak = 0
+                reward_value -= self.reward_config['loss_penalty'] * min(self.loss_streak, 5)
+            self.weekly_profit += realized_pnl
+
         if self.weekly_profit > 0:
-            reward += self.reward_config['weekly_profit_bonus'] * min(self.weekly_profit / TARGET_WEEKLY_PROFIT, 1.0)
-        
-        return observation, reward, terminated, truncated, info
+            reward_value += self.reward_config['weekly_profit_bonus'] * min(self.weekly_profit / TARGET_WEEKLY_PROFIT, 1.0)
+
+        self.last_trade_count = trade_count
+        return observation, reward_value, terminated, truncated, info
 
     def reset(self, seed=None, options=None):
         observation, info = self.env.reset(seed=seed, options=options)
@@ -381,9 +459,10 @@ class CustomRewardWrapper(gym.Wrapper):
         self.loss_streak = 0
         self.weekly_trades = 0
         self.weekly_profit = 0
-        self.last_week = pd.Timestamp.now().isocalendar()[1]
+        self.last_week = self._current_week_bucket()
         self.trade_history = []
         self.position_size = MIN_POSITION_SIZE  # Reset to minimum position size
+        self.last_trade_count = 0
         return observation, info
 
 def make_env(rank, df, seed=0, reward_config=None):
@@ -391,13 +470,25 @@ def make_env(rank, df, seed=0, reward_config=None):
     Create a new environment instance
     """
     def _init():
-        env = TradingEnvironment(df.copy())  # Use a copy for each environment
+        env = TradingEnvironment(df.copy(), mode="train")  # Use a copy for each environment
         env = Monitor(env, f"logs/monitor-{rank}")
-        env = CustomRewardWrapper(env, reward_config or REWARD_SHAPING)
+        if USE_CUSTOM_REWARD_WRAPPER:
+            env = CustomRewardWrapper(env, reward_config or REWARD_SHAPING)
         env.reset(seed=seed + rank)
         return env
     set_random_seed(seed)
     return _init
+
+
+def create_vectorized_env(df, seed=0, reward_config=None):
+    """Create vectorized env according to active profile settings."""
+    env_fns = [
+        make_env(i, df, seed=seed, reward_config=reward_config)
+        for i in range(max(int(NUM_ENVS), 1))
+    ]
+    if VEC_ENV_TYPE == "subproc" and len(env_fns) > 1:
+        return SubprocVecEnv(env_fns, start_method="spawn")
+    return DummyVecEnv(env_fns)
 
 def get_base_env(env):
     """Get the base environment without wrappers"""
@@ -684,7 +775,8 @@ class ProgressCallback(BaseCallback):
                     'eta_to_final_stage_hours': eta_to_final_stage_hours if eta_to_final_stage_hours is not None else 0,
                     'eta_to_full_completion_hours': eta_to_full_completion_hours if eta_to_full_completion_hours is not None else 0
                 })
-            wandb.log(wandb_payload)
+            if _wandb_active():
+                wandb.log(wandb_payload)
 
         return True
 
@@ -737,11 +829,42 @@ class LearningRateMonitor(BaseCallback):
         self.episodes.append(self.n_calls // EPISODE_LENGTH)
         
         # Log to wandb
-        wandb.log({
-            'learning_rate': current_lr,
-            'episode': self.episodes[-1]
-        })
+        if _wandb_active():
+            wandb.log({
+                'learning_rate': current_lr,
+                'episode': self.episodes[-1]
+            })
         
+        return True
+
+
+class EntropyScheduleCallback(BaseCallback):
+    """Warm-start entropy schedule to reduce premature policy collapse."""
+
+    def __init__(self, total_timesteps, start_coef, end_coef, warmup_fraction=0.2, verbose=0):
+        super().__init__(verbose)
+        self.total_timesteps = max(int(total_timesteps), 1)
+        self.start_coef = max(float(start_coef), 0.0)
+        self.end_coef = max(float(end_coef), 0.0)
+        self.warmup_fraction = min(max(float(warmup_fraction), 0.0), 0.95)
+
+    def _coef_at_progress(self, progress):
+        progress = min(max(float(progress), 0.0), 1.0)
+        if progress <= self.warmup_fraction:
+            return self.start_coef
+        tail = (progress - self.warmup_fraction) / max(1.0 - self.warmup_fraction, 1e-9)
+        return self.end_coef + (self.start_coef - self.end_coef) * 0.5 * (1.0 + np.cos(np.pi * tail))
+
+    def _on_step(self):
+        progress = self.num_timesteps / self.total_timesteps
+        coef = self._coef_at_progress(progress)
+        if hasattr(self.model, "ent_coef"):
+            self.model.ent_coef = coef
+        try:
+            if _wandb_active() and self.n_calls % 200 == 0:
+                wandb.log({"entropy_coef": coef, "entropy_progress": progress})
+        except Exception:
+            pass
         return True
 
 def split_train_val_test(df, val_fraction=0.1, test_fraction=0.1):
@@ -780,7 +903,11 @@ def evaluate_model(model, eval_df, tag="eval"):
         logger.warning("Evaluation skipped: eval_df is empty.")
         return {}
 
-    env = TradingEnvironment(eval_df.copy())
+    env = TradingEnvironment(
+        eval_df.copy(),
+        mode="eval",
+        apply_action_shaping=EVAL_ACTION_SHAPING,
+    )
     obs, _ = env.reset()
     data_len = len(env.data['close'])
 
@@ -848,16 +975,19 @@ def evaluate_model(model, eval_df, tag="eval"):
     logger.info(f"Max Drawdown: {metrics['max_drawdown_pct']:.2f}%")
     logger.info("===============================\n")
 
-    try:
-        wandb.log({f"{tag}/{k}": v for k, v in metrics.items()})
-    except Exception as e:
-        logger.warning(f"wandb.log failed during evaluation: {e}")
+    if _wandb_active():
+        try:
+            wandb.log({f"{tag}/{k}": v for k, v in metrics.items()})
+        except Exception as e:
+            logger.warning(f"wandb.log failed during evaluation: {e}")
 
     return metrics
 
 def _build_model(env, hyperparams=None, verbose_override=None):
     hyperparams = hyperparams or {}
     params = PPO_PARAMS.copy()
+    if ENTROPY_SCHEDULE_ENABLED and 'ent_coef' not in hyperparams:
+        params['ent_coef'] = ENTROPY_START_COEF
     # Update PPO params that are part of PPO_PARAMS
     for key in ['n_epochs', 'gamma', 'gae_lambda', 'clip_range', 'ent_coef', 'vf_coef', 'max_grad_norm', 'use_sde', 'sde_sample_freq', 'target_kl']:
         if key in hyperparams:
@@ -878,7 +1008,11 @@ def _build_model(env, hyperparams=None, verbose_override=None):
         **params,
         policy_kwargs=dict(
             features_extractor_class=CustomFeaturesExtractor,
-            features_extractor_kwargs=dict(features_dim=64)
+            features_extractor_kwargs=dict(
+                features_dim=FEATURES_DIM,
+                hidden_dim=FEATURE_EXTRACTOR_HIDDEN_DIM,
+            ),
+            net_arch=dict(pi=POLICY_NET_ARCH, vf=POLICY_NET_ARCH),
         ),
         verbose=verbose
     )
@@ -896,7 +1030,8 @@ def _load_or_build_model(env, hyperparams=None, verbose_override=None, allow_res
 def _hyperparams_valid(hyperparams):
     n_steps = hyperparams.get('n_steps', N_STEPS)
     batch_size = hyperparams.get('batch_size', BATCH_SIZE)
-    if batch_size > n_steps:
+    rollout_capacity = max(int(n_steps) * max(int(NUM_ENVS), 1), 1)
+    if batch_size > rollout_capacity:
         return False
     return True
 
@@ -925,13 +1060,16 @@ def _selection_score(metrics):
         return float('-inf')
     score = metrics.get('return_pct', 0.0) - metrics.get('max_drawdown_pct', 0.0)
     profit_factor = metrics.get('profit_factor', 0.0)
+    total_trades = metrics.get('total_trades', 0)
     if profit_factor <= 1.0:
         score -= 50.0
+    if total_trades < 10:
+        score -= 100.0
     return score
 
 def _train_single_model(train_df, seed, hyperparams, timesteps, callbacks=None, verbose_override=None):
     set_random_seed(seed)
-    env = DummyVecEnv([make_env(0, train_df, seed=seed, reward_config=REWARD_SHAPING)])
+    env = create_vectorized_env(train_df, seed=seed, reward_config=REWARD_SHAPING)
     model = _build_model(env, hyperparams=hyperparams, verbose_override=verbose_override)
     model.learn(total_timesteps=timesteps, callback=callbacks or [])
     return model, env
@@ -981,9 +1119,29 @@ def train():
     if not _acquire_training_lock():
         logger.error("Exiting: another training run is already active.")
         return
+    logger.info(
+        f"Training profile={TRAINING_PROFILE} vec_env={VEC_ENV_TYPE} num_envs={NUM_ENVS} "
+        f"n_steps={N_STEPS} batch_size={BATCH_SIZE} features_dim={FEATURES_DIM} "
+        f"entropy_sched={ENTROPY_SCHEDULE_ENABLED} ent_start={ENTROPY_START_COEF} ent_end={ENTROPY_END_COEF} "
+        f"use_custom_reward_wrapper={USE_CUSTOM_REWARD_WRAPPER}"
+    )
+    logger.info(
+        f"position_size_min={MIN_POSITION_SIZE} position_size_max={MAX_POSITION_SIZE} "
+        f"train_random_start={TRAIN_RANDOM_START} balance_scaling={POSITION_BALANCE_SCALING} "
+        f"balance_floor={POSITION_BALANCE_FLOOR}"
+    )
+    logger.info(f"eval_action_shaping={EVAL_ACTION_SHAPING}")
     # Initialize wandb
-    wandb.init(project="forex-trading-bot", config={
+    wandb_config = {
         'algorithm': 'PPO',
+        'training_profile': TRAINING_PROFILE,
+        'vec_env_type': VEC_ENV_TYPE,
+        'num_envs': NUM_ENVS,
+        'entropy_schedule_enabled': ENTROPY_SCHEDULE_ENABLED,
+        'entropy_start_coef': ENTROPY_START_COEF,
+        'entropy_end_coef': ENTROPY_END_COEF,
+        'entropy_warmup_fraction': ENTROPY_WARMUP_FRACTION,
+        'use_custom_reward_wrapper': USE_CUSTOM_REWARD_WRAPPER,
         'batch_size': BATCH_SIZE,
         'n_steps': N_STEPS,
         'learning_rate': learning_rate_schedule(0),
@@ -991,8 +1149,18 @@ def train():
         'max_timesteps': MAX_TIMESTEPS,
         'min_episodes': MIN_EPISODES,
         'target_weekly_profit': TARGET_WEEKLY_PROFIT,
-        'max_trades_per_week': MAX_TRADES_PER_WEEK
-    })
+        'max_trades_per_week': MAX_TRADES_PER_WEEK,
+        'min_position_size': MIN_POSITION_SIZE,
+        'max_position_size': MAX_POSITION_SIZE,
+        'train_random_start': TRAIN_RANDOM_START,
+        'position_balance_scaling': POSITION_BALANCE_SCALING,
+        'position_balance_floor': POSITION_BALANCE_FLOOR,
+        'eval_action_shaping': EVAL_ACTION_SHAPING,
+    }
+    try:
+        wandb.init(project="forex-trading-bot", config=wandb_config)
+    except Exception as e:
+        logger.warning(f"wandb.init failed; continuing without wandb logging: {e}")
     
     # Create debug logger
     debug_logger = DebugLogger()
@@ -1007,6 +1175,7 @@ def train():
     # Load historical data before environment creation
     fetcher = DataFetcher()
     df = fetcher.fetch_historical_data(
+        download_if_missing=True,
         symbol=SYMBOL,
         timeframe=TIMEFRAME
     )
@@ -1025,14 +1194,14 @@ def train():
 
     # Create vectorized environment
     train_full_df = pd.concat([train_df, val_df]).copy()
-    env = DummyVecEnv([make_env(i, train_full_df, reward_config=REWARD_SHAPING) for i in range(1)])
+    env = create_vectorized_env(train_full_df, reward_config=REWARD_SHAPING)
 
     # Create or resume model
     model = _load_or_build_model(env, hyperparams=selected_params, allow_resume=True)
 
     # Create callbacks
     def _make_callbacks(total_timesteps):
-        return [
+        callbacks = [
             ProgressCallback(
                 debug_logger,
                 update_interval=10,
@@ -1041,6 +1210,16 @@ def train():
             ),
             LearningRateMonitor()
         ]
+        if ENTROPY_SCHEDULE_ENABLED:
+            callbacks.append(
+                EntropyScheduleCallback(
+                    total_timesteps=total_timesteps,
+                    start_coef=ENTROPY_START_COEF,
+                    end_coef=ENTROPY_END_COEF,
+                    warmup_fraction=ENTROPY_WARMUP_FRACTION,
+                )
+            )
+        return callbacks
     
     # Train model
     model.learn(
@@ -1114,7 +1293,11 @@ def train():
         logger.warning(f"wandb final artifact logging failed: {e}")
     
     # Close wandb
-    wandb.finish()
+    try:
+        if _wandb_active():
+            wandb.finish()
+    except Exception:
+        pass
 
 if __name__ == "__main__":
             train()

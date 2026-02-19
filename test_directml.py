@@ -1,7 +1,12 @@
 import torch
-import torch_directml
+import pytest
 
 def test_directml():
+    torch_directml = pytest.importorskip(
+        "torch_directml",
+        reason="torch_directml is not installed in this environment.",
+    )
+
     try:
         # Initialize DirectML
         dml = torch_directml.device()
@@ -19,11 +24,9 @@ def test_directml():
         print("Matrix multiplication successful!")
         print(f"Result shape: {z_cpu.shape}")
         print(f"Device used: {z.device}")
-        
-        return True
+        assert z_cpu.shape == (1000, 1000)
     except Exception as e:
-        print(f"Error testing DirectML: {str(e)}")
-        return False
+        pytest.fail(f"Error testing DirectML: {str(e)}")
 
 if __name__ == "__main__":
     test_directml() 

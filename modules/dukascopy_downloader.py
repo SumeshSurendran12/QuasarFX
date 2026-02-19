@@ -4,7 +4,10 @@ from datetime import datetime, timedelta
 import logging
 from dukascopy_python import fetch
 from dukascopy_python import TIME_UNIT_MIN, TIME_UNIT_HOUR, TIME_UNIT_DAY
-import config
+try:
+    from . import config
+except ImportError:  # pragma: no cover - script mode fallback
+    import config
 
 logger = logging.getLogger(__name__)
 

@@ -8,14 +8,24 @@ import sys
 import traceback
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Union
+
+import matplotlib.pyplot as plt
+import optuna
 import pandas as pd
 import seaborn as sns
 from pathlib import Path
-from config import (
-    INITIAL_BALANCE, 
-    MIN_POSITION_SIZE, 
-    MAX_TRADES_PER_WEEK
-)
+try:
+    from .config import (
+        INITIAL_BALANCE,
+        MIN_POSITION_SIZE,
+        MAX_TRADES_PER_WEEK
+    )
+except ImportError:  # pragma: no cover - script mode fallback
+    from config import (
+        INITIAL_BALANCE,
+        MIN_POSITION_SIZE,
+        MAX_TRADES_PER_WEEK
+    )
 
 class DebugLogger:
     def __init__(self, log_dir: str = "logs"):
@@ -306,7 +316,7 @@ class DebugLogger:
         sns.set_style("whitegrid")
         
         # Create figure with subplots
-        fig, axes = sns.plt.subplots(2, 3, figsize=(15, 10))
+        fig, axes = plt.subplots(2, 3, figsize=(15, 10))
         axes = axes.flatten()
         
         # 1. Optuna Trials (if available)
@@ -394,13 +404,13 @@ class DebugLogger:
             if i >= 6 or (i == 1 and not self.portfolio_metrics) or (i == 4 and self.training_stats['dynamic_costs']['spread'] <= 0) or (i == 5 and not self.error_history):
                 axes[i].set_visible(False)
         
-        sns.plt.tight_layout()
+        plt.tight_layout()
         
         if save_path:
-            sns.plt.savefig(save_path, dpi=300, bbox_inches='tight')
-            sns.plt.close()
+            plt.savefig(save_path, dpi=300, bbox_inches='tight')
+            plt.close()
         else:
-            sns.plt.show()
+            plt.show()
     
     def save_debug_report(self, report: str, filepath: str):
         """Save the debug report to a file"""
@@ -415,15 +425,15 @@ class DebugLogger:
             save_path.mkdir(exist_ok=True)
             
             # Optimization history
-            fig1 = study.optimization_history()
+            fig1 = optuna.visualization.plot_optimization_history(study)
             fig1.write_html(str(save_path / "optimization_history.html"))
             
             # Parameter importance
-            fig2 = study.param_importances()
+            fig2 = optuna.visualization.plot_param_importances(study)
             fig2.write_html(str(save_path / "param_importances.html"))
             
             # Parallel coordinate plot
-            fig3 = study.parallel_coordinate()
+            fig3 = optuna.visualization.plot_parallel_coordinate(study)
             fig3.write_html(str(save_path / "parallel_coordinate.html"))
             
             self.logger.info(f"Optuna visualizations saved to {save_path}")

@@ -1,16 +1,16 @@
 {
-    "episode": 5724,
-    "reward": 73.06134845114866,
-    "timestamp": "2026-02-12T00:56:02.455976",
+    "episode": 8501,
+    "reward": 108.94910637087742,
+    "timestamp": "2026-02-13T02:15:58.002003",
     "trade_stats": {
         "total_trades": 14,
-        "winning_trades": 5,
-        "losing_trades": 8,
-        "win_rate": 0.35714285714285715,
-        "avg_profit": 43.68851806245378,
-        "avg_loss": 32.00127057007625,
-        "profit_factor": 0.8532574895500016,
+        "winning_trades": 7,
+        "losing_trades": 6,
+        "win_rate": 0.5,
+        "avg_profit": 101.0788244225611,
+        "avg_loss": 73.86823177799955,
+        "profit_factor": 1.5964277514326088,
         "max_consecutive_wins": 3,
-        "max_consecutive_losses": 4
+        "max_consecutive_losses": 2
     }
 }
