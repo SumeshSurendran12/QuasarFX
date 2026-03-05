@@ -10,6 +10,7 @@ from typing import Any, Dict, List, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
+import torch as th
 from lightgbm import LGBMClassifier
 from stable_baselines3 import A2C, PPO
 from stable_baselines3.common.vec_env import DummyVecEnv
@@ -130,6 +131,21 @@ def max_drawdown_usd_from_pnls(pnls: np.ndarray) -> float:
     return float(np.max(dd)) if dd.size else 0.0
 
 
+def clamp(x: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, x))
+
+
+def ny_hour_bucket(hour_utc: int) -> str:
+    h = int(hour_utc)
+    if 13 <= h <= 15:
+        return "ny_open"
+    if 16 <= h <= 18:
+        return "ny_lunch"
+    if 19 <= h <= 21:
+        return "ny_close"
+    return "other"
+
+
 def collect_trade_events(
     df: pd.DataFrame,
     feat: pd.DataFrame,
@@ -232,6 +248,10 @@ def collect_trade_events(
                 pnl -= commission_usd(exit_px, lot, costs)
                 notional = abs(float(entry_px) * float(lot) * CONTRACT)
                 pnl_bps = (float(pnl) / notional * 1e4) if notional > 0.0 else 0.0
+                signal_feat = feat.iloc[int(signal_i)]
+                trend_strength_abs = abs(float(signal_feat.get("ma_fast_slow", 0.0)))
+                atr_norm = float(signal_feat.get("atr_norm", np.nan))
+                entry_hour = int(idx[int(entry_i)].hour)
                 events.append(
                     {
                         "signal_index": int(signal_i),
@@ -255,6 +275,10 @@ def collect_trade_events(
                         "pnl_bps": float(pnl_bps),
                         "bars_held": int(bars_held),
                         "reason": str(reason),
+                        "trend_strength_abs": float(trend_strength_abs),
+                        "atr_norm": float(atr_norm),
+                        "entry_hour_utc": int(entry_hour),
+                        "hour_bucket": ny_hour_bucket(entry_hour),
                     }
                 )
                 in_pos = False
@@ -421,16 +445,77 @@ def train_gate_policy(
     return model
 
 
-def predict_take_actions(model: PPO | A2C | None, observations: np.ndarray) -> np.ndarray:
+def extract_take_scores(model: PPO | A2C | None, observations: np.ndarray) -> np.ndarray:
     if observations.shape[0] == 0:
-        return np.zeros((0,), dtype=np.int32)
+        return np.zeros((0,), dtype=np.float32)
     if model is None:
-        return np.ones((observations.shape[0],), dtype=np.int32)
-    out = np.zeros((observations.shape[0],), dtype=np.int32)
-    for i in range(observations.shape[0]):
-        action, _ = model.predict(observations[i], deterministic=True)
-        out[i] = 1 if int(np.asarray(action).reshape(-1)[0]) > 0 else 0
-    return out
+        return np.ones((observations.shape[0],), dtype=np.float32)
+    obs = np.asarray(observations, dtype=np.float32)
+    with th.no_grad():
+        obs_tensor, _ = model.policy.obs_to_tensor(obs)
+        dist = model.policy.get_distribution(obs_tensor)
+        probs = dist.distribution.probs.detach().cpu().numpy()
+    if probs.ndim == 1:
+        return probs.astype(np.float32)
+    if probs.shape[1] < 2:
+        return np.zeros((obs.shape[0],), dtype=np.float32)
+    return probs[:, 1].astype(np.float32)
+
+
+def choose_take_threshold(
+    train_scores: np.ndarray,
+    target_take_rate: float,
+    take_rate_min: float,
+    take_rate_max: float,
+) -> Tuple[float, float]:
+    if train_scores.size == 0:
+        return 0.5, 0.0
+    tmin = float(clamp(take_rate_min, 0.0, 1.0))
+    tmax = float(clamp(take_rate_max, tmin, 1.0))
+    target = float(clamp(target_take_rate, tmin, tmax))
+    scores = np.asarray(train_scores, dtype=float)
+
+    q = float(clamp(1.0 - target, 0.0, 1.0))
+    q_thr = float(np.quantile(scores, q))
+    q_rate = float(np.mean(scores >= q_thr))
+    if tmin <= q_rate <= tmax:
+        return q_thr, q_rate
+
+    cands = np.unique(scores)
+    if cands.size == 0:
+        return 0.5, 0.0
+    cands = np.concatenate(([-1e9], cands, [1e9]))
+    best_thr = float(q_thr)
+    best_rate = float(q_rate)
+    best_cost = float("inf")
+    for thr in cands:
+        rate = float(np.mean(scores >= float(thr)))
+        band_pen = 0.0
+        if rate < tmin:
+            band_pen = tmin - rate
+        elif rate > tmax:
+            band_pen = rate - tmax
+        cost = band_pen * 10.0 + abs(rate - target)
+        if cost < best_cost:
+            best_cost = cost
+            best_thr = float(thr)
+            best_rate = float(rate)
+    return best_thr, best_rate
+
+
+def actions_from_scores(scores: np.ndarray, threshold: float) -> np.ndarray:
+    if scores.size == 0:
+        return np.zeros((0,), dtype=np.int32)
+    return (np.asarray(scores, dtype=float) >= float(threshold)).astype(np.int32)
+
+
+def selected_events_from_actions(events: List[Dict[str, Any]], actions: np.ndarray) -> List[Dict[str, Any]]:
+    if not events:
+        return []
+    if actions.shape[0] != len(events):
+        raise ValueError("actions length mismatch")
+    mask = actions.astype(bool)
+    return [events[i] for i in range(len(events)) if bool(mask[i])]
 
 
 def metrics_from_actions(events: List[Dict[str, Any]], actions: np.ndarray) -> Dict[str, float]:
@@ -439,21 +524,22 @@ def metrics_from_actions(events: List[Dict[str, Any]], actions: np.ndarray) -> D
             "take_rate": 0.0,
             "trades": 0.0,
             "net_usd": 0.0,
+            "net_bps": 0.0,
+            "edge_per_trade_bps": 0.0,
             "pf": 0.0,
             "win_rate": 0.0,
             "avg_trade_usd": 0.0,
             "max_dd_usd": 0.0,
             "avg_hold_bars": 0.0,
         }
-    if actions.shape[0] != len(events):
-        raise ValueError("actions length mismatch")
-    mask = actions.astype(bool)
-    taken = [events[i] for i in range(len(events)) if bool(mask[i])]
+    taken = selected_events_from_actions(events, actions)
     if not taken:
         return {
-            "take_rate": float(np.mean(mask.astype(float))),
+            "take_rate": float(np.mean(actions.astype(float))),
             "trades": 0.0,
             "net_usd": 0.0,
+            "net_bps": 0.0,
+            "edge_per_trade_bps": 0.0,
             "pf": 0.0,
             "win_rate": 0.0,
             "avg_trade_usd": 0.0,
@@ -461,18 +547,130 @@ def metrics_from_actions(events: List[Dict[str, Any]], actions: np.ndarray) -> D
             "avg_hold_bars": 0.0,
         }
     pnl = np.asarray([float(x["pnl_usd"]) for x in taken], dtype=float)
+    pnl_bps = np.asarray([float(x.get("pnl_bps", 0.0)) for x in taken], dtype=float)
     bars = np.asarray([float(x["bars_held"]) for x in taken], dtype=float)
     pf = profit_factor_from_pnls(pnl)
+    net_bps = float(np.sum(pnl_bps))
     return {
-        "take_rate": float(np.mean(mask.astype(float))),
+        "take_rate": float(np.mean(actions.astype(float))),
         "trades": float(pnl.size),
         "net_usd": float(np.sum(pnl)),
+        "net_bps": net_bps,
+        "edge_per_trade_bps": float(net_bps / max(int(pnl.size), 1)),
         "pf": float(pf),
         "win_rate": float(np.mean(pnl > 0.0)),
         "avg_trade_usd": float(np.mean(pnl)),
         "max_dd_usd": float(max_drawdown_usd_from_pnls(pnl)),
         "avg_hold_bars": float(np.mean(bars)),
     }
+
+
+def bootstrap_pf_confidence(pnls: np.ndarray, n_boot: int, seed: int) -> Dict[str, float]:
+    out = {
+        "pf_bootstrap_p05": float("nan"),
+        "pf_bootstrap_p50": float("nan"),
+        "pf_bootstrap_p95": float("nan"),
+    }
+    x = np.asarray(pnls, dtype=float)
+    if x.size == 0 or int(n_boot) <= 0:
+        return out
+    rng = np.random.default_rng(int(seed))
+    vals = np.zeros((int(n_boot),), dtype=float)
+    n = int(x.size)
+    for i in range(int(n_boot)):
+        sample = x[rng.integers(0, n, size=n)]
+        pf = profit_factor_from_pnls(sample)
+        vals[i] = float(10.0 if not np.isfinite(pf) else pf)
+    out["pf_bootstrap_p05"] = float(np.quantile(vals, 0.05))
+    out["pf_bootstrap_p50"] = float(np.quantile(vals, 0.50))
+    out["pf_bootstrap_p95"] = float(np.quantile(vals, 0.95))
+    return out
+
+
+def regime_attribution(
+    selected_events: List[Dict[str, Any]],
+    all_events: List[Dict[str, Any]],
+    trend_min: float,
+) -> Dict[str, float]:
+    out = {
+        "trend_frac": 0.0,
+        "range_frac": 0.0,
+        "atr_low_frac": 0.0,
+        "atr_mid_frac": 0.0,
+        "atr_high_frac": 0.0,
+        "ny_open_frac": 0.0,
+        "ny_lunch_frac": 0.0,
+        "ny_close_frac": 0.0,
+        "other_hour_frac": 0.0,
+    }
+    if not selected_events:
+        return out
+
+    trend_flags = np.asarray(
+        [1.0 if float(ev.get("trend_strength_abs", 0.0)) >= float(trend_min) else 0.0 for ev in selected_events],
+        dtype=float,
+    )
+    out["trend_frac"] = float(np.mean(trend_flags))
+    out["range_frac"] = float(1.0 - out["trend_frac"])
+
+    all_atr = np.asarray([float(ev.get("atr_norm", np.nan)) for ev in all_events], dtype=float)
+    all_atr = all_atr[np.isfinite(all_atr)]
+    sel_atr = np.asarray([float(ev.get("atr_norm", np.nan)) for ev in selected_events], dtype=float)
+    sel_atr = sel_atr[np.isfinite(sel_atr)]
+    if all_atr.size >= 3 and sel_atr.size > 0:
+        q1 = float(np.quantile(all_atr, 1.0 / 3.0))
+        q2 = float(np.quantile(all_atr, 2.0 / 3.0))
+        low = np.mean(sel_atr <= q1)
+        high = np.mean(sel_atr > q2)
+        mid = 1.0 - low - high
+        out["atr_low_frac"] = float(low)
+        out["atr_mid_frac"] = float(max(0.0, mid))
+        out["atr_high_frac"] = float(high)
+
+    buckets = [str(ev.get("hour_bucket", "other")) for ev in selected_events]
+    n = float(len(buckets))
+    out["ny_open_frac"] = float(sum(1 for b in buckets if b == "ny_open") / n)
+    out["ny_lunch_frac"] = float(sum(1 for b in buckets if b == "ny_lunch") / n)
+    out["ny_close_frac"] = float(sum(1 for b in buckets if b == "ny_close") / n)
+    out["other_hour_frac"] = float(sum(1 for b in buckets if b not in {"ny_open", "ny_lunch", "ny_close"}) / n)
+    return out
+
+
+def shuffle_take_sanity(
+    all_events: List[Dict[str, Any]],
+    take_count: int,
+    n_trials: int,
+    seed: int,
+    model_pf: float,
+) -> Dict[str, float]:
+    out = {
+        "shuffle_trials": int(max(n_trials, 0)),
+        "shuffle_pf_mean": float("nan"),
+        "shuffle_pf_p95": float("nan"),
+        "shuffle_net_mean": float("nan"),
+        "shuffle_pf_ge_model_prob": float("nan"),
+    }
+    n = len(all_events)
+    k = int(max(0, min(int(take_count), n)))
+    t = int(max(0, n_trials))
+    if n == 0 or k == 0 or t == 0:
+        return out
+    pnl_all = np.asarray([float(ev.get("pnl_usd", 0.0)) for ev in all_events], dtype=float)
+    rng = np.random.default_rng(int(seed))
+    pf_vals = np.zeros((t,), dtype=float)
+    net_vals = np.zeros((t,), dtype=float)
+    model_pf_cap = float(10.0 if not np.isfinite(model_pf) else model_pf)
+    for i in range(t):
+        pick = rng.choice(n, size=k, replace=False)
+        pnl = pnl_all[pick]
+        pf = profit_factor_from_pnls(pnl)
+        pf_vals[i] = float(10.0 if not np.isfinite(pf) else pf)
+        net_vals[i] = float(np.sum(pnl))
+    out["shuffle_pf_mean"] = float(np.mean(pf_vals))
+    out["shuffle_pf_p95"] = float(np.quantile(pf_vals, 0.95))
+    out["shuffle_net_mean"] = float(np.mean(net_vals))
+    out["shuffle_pf_ge_model_prob"] = float(np.mean(pf_vals >= model_pf_cap))
+    return out
 
 
 def summarize_rows(rows: pd.DataFrame) -> Dict[str, float | int]:
@@ -488,6 +686,13 @@ def summarize_rows(rows: pd.DataFrame) -> Dict[str, float | int]:
             "dd_worst": 0.0,
             "trades_total": 0,
             "take_rate_mean": 0.0,
+            "edge_per_trade_bps_mean": 0.0,
+            "base_event_count_total": 0,
+            "min_trades_per_fold": 0.0,
+            "folds_trades_ge_3": 0,
+            "pf_bootstrap_p05_median": float("nan"),
+            "pf_bootstrap_p95_median": float("nan"),
+            "shuffle_pf_ge_model_prob_mean": float("nan"),
             "base_net_sum": 0.0,
             "base_pf_mean": 0.0,
         }
@@ -507,6 +712,13 @@ def summarize_rows(rows: pd.DataFrame) -> Dict[str, float | int]:
         "dd_worst": float(rows["max_dd_usd"].max()) if not rows.empty else 0.0,
         "trades_total": int(rows["trades"].sum()),
         "take_rate_mean": float(rows["take_rate"].mean()) if not rows.empty else 0.0,
+        "edge_per_trade_bps_mean": float(rows["edge_per_trade_bps"].mean()) if "edge_per_trade_bps" in rows.columns else 0.0,
+        "base_event_count_total": int(rows["base_event_count"].sum()) if "base_event_count" in rows.columns else 0,
+        "min_trades_per_fold": float(rows["trades"].min()) if not rows.empty else 0.0,
+        "folds_trades_ge_3": int((rows["trades"] >= 3).sum()) if "trades" in rows.columns else 0,
+        "pf_bootstrap_p05_median": float(rows["pf_bootstrap_p05"].median()) if "pf_bootstrap_p05" in rows.columns else float("nan"),
+        "pf_bootstrap_p95_median": float(rows["pf_bootstrap_p95"].median()) if "pf_bootstrap_p95" in rows.columns else float("nan"),
+        "shuffle_pf_ge_model_prob_mean": float(rows["shuffle_pf_ge_model_prob"].mean()) if "shuffle_pf_ge_model_prob" in rows.columns else float("nan"),
         "base_net_sum": float(rows["base_net_usd"].sum()),
         "base_pf_mean": float(np.mean(base_pf_vals)) if base_pf_vals.size else 0.0,
     }
@@ -521,6 +733,7 @@ def to_markdown(payload: Dict[str, Any]) -> str:
         f"- Data: `{payload['data_csv']}`",
         f"- Mode: `{payload['mode']}`",
         f"- Policy: `{payload['rl']['algo']}` | train_timesteps={payload['rl']['train_timesteps']} | min_train_events={payload['rl']['min_train_events']}",
+        f"- Gate calibration: target_take_rate={payload['rl']['target_take_rate']:.2f} in [{payload['rl']['take_rate_min']:.2f}, {payload['rl']['take_rate_max']:.2f}]",
         f"- Observation: `{'market_features_only' if payload['rl']['market_features_only'] else 'market_plus_trade_state'}`",
         f"- Costs: spread={payload['costs']['spread']}, slippage={payload['costs']['slippage']}, commission={payload['costs']['commission']}",
         "",
@@ -529,17 +742,19 @@ def to_markdown(payload: Dict[str, Any]) -> str:
         f"- net_sum: `{float(s.get('net_sum', 0.0)):.2f}` | net_mean: `{float(s.get('net_mean', 0.0)):.2f}` | net_std: `{float(s.get('net_std', 0.0)):.2f}`",
         f"- pos_fold_rate: `{float(s.get('pos_fold_rate', 0.0)):.2f}` | worst_fold_net: `{float(s.get('worst_fold_net', 0.0)):.2f}`",
         f"- PF_mean: `{float(s.get('pf_mean', 0.0)):.3f}` | worst_DD: `{float(s.get('dd_worst', 0.0)):.2f}` | trades_total: `{int(s.get('trades_total', 0))}`",
+        f"- take_rate_mean: `{float(s.get('take_rate_mean', 0.0)):.3f}` | edge_per_trade_bps_mean: `{float(s.get('edge_per_trade_bps_mean', 0.0)):.3f}`",
+        f"- sample: base_event_count_total=`{int(s.get('base_event_count_total', 0))}` | min_trades_per_fold=`{float(s.get('min_trades_per_fold', 0.0)):.1f}` | folds_trades_ge_3=`{int(s.get('folds_trades_ge_3', 0))}`",
         "",
         "## Fold Table",
         "",
-        "| Fold | Device | Test Start | Test End | Train Events | Test Events | Take Rate | Trades | Net USD | PF | Max DD | Base Trades | Base Net USD | Base PF |",
-        "| ---: | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+        "| Fold | Device | Test Start | Test End | Train Events | Base Events | Take Rate | Thr | Trades | Net USD | Net bps | Edge bps/trade | PF | PF boot p05/p95 | Shuf PF>=model |",
+        "| ---: | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
     ]
     for r in payload.get("fold_rows", []):
         lines.append(
-            f"| {r['fold']} | {r['model_device']} | {r['test_start']} | {r['test_end']} | {r['train_events']} | {r['test_events']} | "
-            f"{float(r['take_rate']):.3f} | {int(r['trades'])} | {float(r['net_usd']):.2f} | {float(r['pf']):.3f} | {float(r['max_dd_usd']):.2f} | "
-            f"{int(r['base_trades'])} | {float(r['base_net_usd']):.2f} | {float(r['base_pf']):.3f} |"
+            f"| {r['fold']} | {r['model_device']} | {r['test_start']} | {r['test_end']} | {r['train_events']} | {r['base_event_count']} | "
+            f"{float(r['take_rate']):.3f} | {float(r['gate_threshold']):.4f} | {int(r['trades'])} | {float(r['net_usd']):.2f} | {float(r['net_bps']):.2f} | "
+            f"{float(r['edge_per_trade_bps']):.3f} | {float(r['pf']):.3f} | {float(r['pf_bootstrap_p05']):.3f}/{float(r['pf_bootstrap_p95']):.3f} | {float(r['shuffle_pf_ge_model_prob']):.3f} |"
         )
     return "\n".join(lines) + "\n"
 
@@ -592,6 +807,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--rl-skip-penalty-bps", type=float, default=0.0)
     p.add_argument("--rl-trade-penalty-bps", type=float, default=0.05)
     p.add_argument("--rl-reward-clip-bps", type=float, default=500.0)
+    p.add_argument("--rl-target-take-rate", type=float, default=0.30)
+    p.add_argument("--rl-take-rate-min", type=float, default=0.15)
+    p.add_argument("--rl-take-rate-max", type=float, default=0.60)
+    p.add_argument("--rl-bootstrap-samples", type=int, default=400)
+    p.add_argument("--rl-sanity-shuffle-trials", type=int, default=200)
     p.add_argument("--market-features-only", dest="market_features_only", action="store_true")
     p.add_argument("--market-plus-trade-state", dest="market_features_only", action="store_false")
     p.set_defaults(market_features_only=True)
@@ -623,6 +843,10 @@ def main() -> int:
         raise ValueError("--atr-norm-max-quantile must be in (0, 1].")
     if atr_q_min > atr_q_max:
         raise ValueError("--atr-norm-min-quantile cannot exceed --atr-norm-max-quantile.")
+    if float(args.rl_take_rate_min) < 0.0 or float(args.rl_take_rate_max) > 1.0:
+        raise ValueError("RL take-rate bounds must be in [0, 1].")
+    if float(args.rl_take_rate_min) > float(args.rl_take_rate_max):
+        raise ValueError("--rl-take-rate-min cannot exceed --rl-take-rate-max.")
 
     df = load_ohlcv_csv(csv_path)
     feat = build_features(df)
@@ -793,24 +1017,57 @@ def main() -> int:
 
         model: PPO | A2C | None = None
         policy_path = ""
+        gate_threshold = 0.5
+        train_take_rate_before_calib = 1.0
+        train_take_rate_after_calib = 1.0
         if train_events and len(train_events) >= int(args.rl_min_train_events):
             model = train_gate_policy(
                 observations=train_obs,
                 rewards_bps=train_rewards_bps,
                 algo=str(args.rl_algo),
                 total_timesteps=int(args.rl_train_timesteps),
-                seed=int(args.rl_seed) + int(fold_num),
+                seed=int(args.rl_seed),
                 reward_cfg=reward_cfg,
+            )
+            train_scores = extract_take_scores(model, train_obs)
+            train_take_rate_before_calib = float(np.mean(train_scores >= 0.5)) if train_scores.size else 0.0
+            gate_threshold, train_take_rate_after_calib = choose_take_threshold(
+                train_scores=train_scores,
+                target_take_rate=float(args.rl_target_take_rate),
+                take_rate_min=float(args.rl_take_rate_min),
+                take_rate_max=float(args.rl_take_rate_max),
             )
             if args.save_fold_policies:
                 path = policy_dir / f"{args.out_prefix}_fold{fold_num:02d}.zip"
                 model.save(str(path))
                 policy_path = str(path)
+        else:
+            gate_threshold = 0.0
 
         eval_events = train_events if bool(args.train_only) else test_events
         eval_obs = train_obs if bool(args.train_only) else test_obs
-        actions = predict_take_actions(model, eval_obs)
+        eval_scores = extract_take_scores(model, eval_obs)
+        actions = actions_from_scores(eval_scores, gate_threshold)
         selected_metrics = metrics_from_actions(eval_events, actions)
+        selected_events = selected_events_from_actions(eval_events, actions)
+        selected_trade_pnls = np.asarray([float(ev.get("pnl_usd", 0.0)) for ev in selected_events], dtype=float)
+        pf_boot = bootstrap_pf_confidence(
+            selected_trade_pnls,
+            n_boot=int(args.rl_bootstrap_samples),
+            seed=int(args.rl_seed) + int(fold_num),
+        )
+        attrib = regime_attribution(
+            selected_events=selected_events,
+            all_events=eval_events,
+            trend_min=float(args.trend_min),
+        )
+        sanity = shuffle_take_sanity(
+            all_events=eval_events,
+            take_count=int(selected_metrics["trades"]),
+            n_trials=int(args.rl_sanity_shuffle_trials),
+            seed=int(args.rl_seed) + int(fold_num),
+            model_pf=float(selected_metrics["pf"]),
+        )
         base_actions = np.ones((len(eval_events),), dtype=np.int32)
         base_metrics = metrics_from_actions(eval_events, base_actions)
         fold_rows.append(
@@ -827,14 +1084,23 @@ def main() -> int:
                 "policy_trained": bool(model is not None),
                 "policy_path": policy_path,
                 "eval_scope": "train" if bool(args.train_only) else "test",
+                "gate_threshold": float(gate_threshold),
+                "train_take_rate_before_calib": float(train_take_rate_before_calib),
+                "train_take_rate_after_calib": float(train_take_rate_after_calib),
+                "base_event_count": int(len(eval_events)),
                 "take_rate": float(selected_metrics["take_rate"]),
                 "trades": int(selected_metrics["trades"]),
                 "net_usd": float(selected_metrics["net_usd"]),
+                "net_bps": float(selected_metrics["net_bps"]),
+                "edge_per_trade_bps": float(selected_metrics["edge_per_trade_bps"]),
                 "pf": float(selected_metrics["pf"]),
                 "win_rate": float(selected_metrics["win_rate"]),
                 "avg_trade_usd": float(selected_metrics["avg_trade_usd"]),
                 "max_dd_usd": float(selected_metrics["max_dd_usd"]),
                 "avg_hold_bars": float(selected_metrics["avg_hold_bars"]),
+                **pf_boot,
+                **attrib,
+                **sanity,
                 "base_take_rate": float(base_metrics["take_rate"]),
                 "base_trades": int(base_metrics["trades"]),
                 "base_net_usd": float(base_metrics["net_usd"]),
@@ -901,12 +1167,18 @@ def main() -> int:
         },
         "rl": {
             "algo": str(args.rl_algo),
+            "training_scheme": "per_fold_fixed_calibration",
             "train_timesteps": int(args.rl_train_timesteps),
             "min_train_events": int(args.rl_min_train_events),
             "seed": int(args.rl_seed),
             "skip_penalty_bps": float(args.rl_skip_penalty_bps),
             "trade_penalty_bps": float(args.rl_trade_penalty_bps),
             "reward_clip_bps": float(args.rl_reward_clip_bps),
+            "target_take_rate": float(args.rl_target_take_rate),
+            "take_rate_min": float(args.rl_take_rate_min),
+            "take_rate_max": float(args.rl_take_rate_max),
+            "bootstrap_samples": int(args.rl_bootstrap_samples),
+            "sanity_shuffle_trials": int(args.rl_sanity_shuffle_trials),
             "market_features_only": bool(args.market_features_only),
             "save_fold_policies": bool(args.save_fold_policies),
             "policy_dir": str(policy_dir.resolve()),
