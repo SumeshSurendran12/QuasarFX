@@ -128,6 +128,10 @@ ENTRY_EXPECTANCY_REWARD_WEIGHT = float(os.getenv("FX_ENTRY_EXPECTANCY_REWARD_WEI
 LOW_EXPECTANCY_ENTRY_PENALTY = float(os.getenv("FX_LOW_EXPECTANCY_ENTRY_PENALTY", "-0.002"))  # Penalty for attempting low-expectancy entries
 LOW_EXPECTANCY_CLOSE_PENALTY_SCALE = float(os.getenv("FX_LOW_EXPECTANCY_CLOSE_PENALTY_SCALE", "0.80"))  # Extra penalty on close for low-expectancy entries
 
+# === Strategy Profiles (frozen deployment configs) ===
+STRATEGY_1_NAME = os.getenv("FX_STRATEGY_1_NAME", "London Compression Breakout (Low Spread Only)")
+STRATEGY_1_LIVE_MAX_SPREAD = float(os.getenv("FX_STRATEGY_1_LIVE_MAX_SPREAD", "0.00022"))  # Skip entries when live spread exceeds this threshold
+
 # === 6. Training/Backtesting Parameters ===
 MAX_EPISODES = 2200000  # Maximum number of training episodes
 MAX_TIMESTEPS = 1000000  # Maximum number of training timesteps (standard real training)

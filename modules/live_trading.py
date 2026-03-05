@@ -11,9 +11,25 @@ import logging
 import pickle
 from typing import Dict, List, Tuple, Optional
 try:
-    from .config import MT5_CONFIG, MIN_POSITION_SIZE, MAX_POSITION_SIZE, STOP_LOSS, PROFIT_TARGET
+    from .config import (
+        MT5_CONFIG,
+        MIN_POSITION_SIZE,
+        MAX_POSITION_SIZE,
+        STOP_LOSS,
+        PROFIT_TARGET,
+        STRATEGY_1_NAME,
+        STRATEGY_1_LIVE_MAX_SPREAD,
+    )
 except ImportError:  # pragma: no cover - script mode fallback
-    from config import MT5_CONFIG, MIN_POSITION_SIZE, MAX_POSITION_SIZE, STOP_LOSS, PROFIT_TARGET
+    from config import (  # type: ignore[no-redef]
+        MT5_CONFIG,
+        MIN_POSITION_SIZE,
+        MAX_POSITION_SIZE,
+        STOP_LOSS,
+        PROFIT_TARGET,
+        STRATEGY_1_NAME,
+        STRATEGY_1_LIVE_MAX_SPREAD,
+    )
                     
 
 logger = logging.getLogger(__name__)
@@ -264,7 +280,11 @@ class LiveTradingEnvironment:
 
     def execute_trade(self, action: int):
         """Execute trading action based on model decision"""
-        current_price = mt5.symbol_info_tick(self.symbol).ask
+        tick = mt5.symbol_info_tick(self.symbol)
+        if tick is None:
+            logger.warning("No tick data available; skipping action.")
+            return
+        current_price = tick.ask
 
         # Refresh current position state from MT5 (FIFO/no-hedge safe)
         positions = self._get_symbol_positions()
@@ -279,14 +299,24 @@ class LiveTradingEnvironment:
         # Hold
         if action == 0:
             return
+
+        # Strategy 1 hard spread gate for new entries.
+        live_spread = float(tick.ask - tick.bid)
+        entry_blocked_by_spread = live_spread > float(STRATEGY_1_LIVE_MAX_SPREAD)
         
         # Buy
-        elif action == 1 and self.position <= 0:
+        if action == 1 and self.position <= 0:
             if self.position < 0:
                 # FIFO/hedging-safe: close first, then wait for next tick to open
                 closed = self._close_position()
                 if closed:
                     logger.info("Closed short; will wait before opening long.")
+                return
+            if entry_blocked_by_spread:
+                logger.info(
+                    f"Skip BUY entry [{STRATEGY_1_NAME}] due to live spread "
+                    f"{live_spread:.5f} > {float(STRATEGY_1_LIVE_MAX_SPREAD):.5f}"
+                )
                 return
 
             # Update position size based on win rate
@@ -304,6 +334,12 @@ class LiveTradingEnvironment:
                 closed = self._close_position()
                 if closed:
                     logger.info("Closed long; will wait before opening short.")
+                return
+            if entry_blocked_by_spread:
+                logger.info(
+                    f"Skip SELL entry [{STRATEGY_1_NAME}] due to live spread "
+                    f"{live_spread:.5f} > {float(STRATEGY_1_LIVE_MAX_SPREAD):.5f}"
+                )
                 return
 
             # Update position size based on win rate
