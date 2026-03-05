@@ -81,16 +81,28 @@ def parse_hour_windows(raw: str) -> List[Tuple[int, int]]:
     return windows
 
 
+def matching_hour_window_index(ts: pd.Timestamp, windows: Sequence[Tuple[int, int]]) -> int:
+    hour = int(ts.hour)
+    for i, (start, end) in enumerate(windows):
+        if start <= end and start <= hour <= end:
+            return i
+        if start > end and (hour >= start or hour <= end):
+            return i
+    return -1
+
+
 def in_hour_windows(ts: pd.Timestamp, windows: Sequence[Tuple[int, int]]) -> bool:
     if not windows:
         return True
-    hour = int(ts.hour)
-    for start, end in windows:
-        if start <= end and start <= hour <= end:
-            return True
-        if start > end and (hour >= start or hour <= end):
-            return True
-    return False
+    return matching_hour_window_index(ts, windows) >= 0
+
+
+def session_bucket_key(ts: pd.Timestamp, session_filter: str, hour_windows: Sequence[Tuple[int, int]]) -> str:
+    day = ts.strftime("%Y-%m-%d")
+    if hour_windows:
+        win_idx = matching_hour_window_index(ts, hour_windows)
+        return f"{day}|win{win_idx}"
+    return f"{day}|{session_filter}"
 
 
 def rolling_quantile_threshold(series: pd.Series, window: int, quantile: float) -> pd.Series:
@@ -192,6 +204,36 @@ def walk_forward_splits(
         test_end = train_end + pd.DateOffset(months=int(test_months))
 
     return splits
+
+
+def parse_utc_ts(raw: str) -> pd.Timestamp:
+    ts = pd.Timestamp(raw)
+    if ts.tzinfo is None:
+        ts = ts.tz_localize("UTC")
+    else:
+        ts = ts.tz_convert("UTC")
+    return ts
+
+
+def lockbox_split(
+    index: pd.DatetimeIndex,
+    train_end: str,
+    test_start: str,
+    test_end: str,
+) -> List[Tuple[np.ndarray, np.ndarray]]:
+    idx = pd.DatetimeIndex(index)
+    tr_end = parse_utc_ts(train_end)
+    te_start = parse_utc_ts(test_start)
+    te_end = parse_utc_ts(test_end)
+    if te_end < te_start:
+        raise ValueError("lockbox test_end must be >= test_start")
+    tr_mask = idx <= tr_end
+    te_mask = (idx >= te_start) & (idx <= te_end)
+    tr_idx = np.where(tr_mask)[0]
+    te_idx = np.where(te_mask)[0]
+    if tr_idx.size == 0 or te_idx.size == 0:
+        raise ValueError("Lockbox split produced empty train or test indices.")
+    return [(tr_idx, te_idx)]
 
 
 def in_session(ts: pd.Timestamp, mode: str) -> bool:
@@ -353,11 +395,13 @@ def simulate_strategy_on_test(
     time_stop_bars: int,
     session_filter: str,
     hour_windows: Sequence[Tuple[int, int]],
+    max_trades_per_session: int,
     regime_filter: str,
     trend_min: float,
     require_close_confirm: bool,
     compression_threshold: np.ndarray | None,
-    atr_norm_threshold: np.ndarray | None,
+    atr_norm_min_threshold: np.ndarray | None,
+    atr_norm_max_threshold: np.ndarray | None,
     lot: float,
     costs: Costs,
 ) -> Dict[str, Any]:
@@ -394,6 +438,7 @@ def simulate_strategy_on_test(
     entry_i = -1
     entry_time = None
     buffer = float(buffer_pips) * PIP
+    trades_by_session: Dict[str, int] = {}
 
     for t in range(max(int(lookback), test_start), test_end + 1):
         if t not in test_set:
@@ -473,6 +518,9 @@ def simulate_strategy_on_test(
             continue
         if not in_hour_windows(idx[t], hour_windows):
             continue
+        sess_key = session_bucket_key(idx[t], session_filter, hour_windows)
+        if int(max_trades_per_session) > 0 and int(trades_by_session.get(sess_key, 0)) >= int(max_trades_per_session):
+            continue
         if not regime_ok(feat.iloc[t], regime_filter, trend_min):
             continue
         if compression_threshold is not None:
@@ -480,10 +528,15 @@ def simulate_strategy_on_test(
             comp_th = float(compression_threshold[t])
             if not np.isfinite(comp_val) or not np.isfinite(comp_th) or comp_val > comp_th:
                 continue
-        if atr_norm_threshold is not None:
+        if atr_norm_min_threshold is not None:
             atr_val = float(feat.iloc[t].get("atr_norm", np.nan))
-            atr_th = float(atr_norm_threshold[t])
-            if not np.isfinite(atr_val) or not np.isfinite(atr_th) or atr_val > atr_th:
+            atr_min = float(atr_norm_min_threshold[t])
+            if not np.isfinite(atr_val) or not np.isfinite(atr_min) or atr_val < atr_min:
+                continue
+        if atr_norm_max_threshold is not None:
+            atr_val = float(feat.iloc[t].get("atr_norm", np.nan))
+            atr_max = float(atr_norm_max_threshold[t])
+            if not np.isfinite(atr_val) or not np.isfinite(atr_max) or atr_val > atr_max:
                 continue
 
         recent_high = float(np.max(h[t - int(lookback) : t]))
@@ -534,6 +587,7 @@ def simulate_strategy_on_test(
         side = int(chosen_side)
         entry_i = int(t1)
         entry_time = idx[t1]
+        trades_by_session[sess_key] = int(trades_by_session.get(sess_key, 0)) + 1
 
     pnl = np.asarray([tr.pnl_usd for tr in trades], dtype=float)
     wins = pnl[pnl > 0.0]
@@ -609,15 +663,22 @@ def to_markdown(summary: Dict[str, Any]) -> str:
         f"step {summary['walk_forward']['step_months']}m, "
         f"folds={summary['walk_forward']['folds']}"
     )
+    if summary["walk_forward"]["mode"] == "lockbox":
+        lines.append(
+            f"- Lockbox: train_end={summary['walk_forward']['lockbox_train_end']}, "
+            f"test_start={summary['walk_forward']['lockbox_test_start']}, "
+            f"test_end={summary['walk_forward']['lockbox_test_end']}"
+        )
     lines.append(
         f"- Filters: session={summary['filters']['session']}, "
         f"hours='{summary['filters']['hour_windows']}', "
+        f"max_trades_per_session={summary['filters']['max_trades_per_session']}, "
         f"regime={summary['filters']['regime']}, trend_min={summary['filters']['trend_min']}"
     )
     lines.append(
         f"- Expansion gates: compression_q<={summary['filters']['compression_max_quantile']} "
         f"(window={summary['filters']['compression_window']}), "
-        f"atr_norm_q<={summary['filters']['atr_norm_max_quantile']} "
+        f"atr_norm_band=[{summary['filters']['atr_norm_min_quantile']}, {summary['filters']['atr_norm_max_quantile']}] "
         f"(window={summary['filters']['atr_window']}), "
         f"close_confirm={summary['filters']['require_close_confirm']}"
     )
@@ -680,6 +741,9 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--data-csv", required=True)
     parser.add_argument("--out-prefix", required=True)
+    parser.add_argument("--lockbox-train-end", default="", help="UTC timestamp/date inclusive train end for lockbox mode.")
+    parser.add_argument("--lockbox-test-start", default="", help="UTC timestamp/date inclusive test start for lockbox mode.")
+    parser.add_argument("--lockbox-test-end", default="", help="UTC timestamp/date inclusive test end for lockbox mode.")
     parser.add_argument("--horizon-bars", type=int, default=6)
     parser.add_argument("--move-threshold-pips", type=float, default=40.0)
     parser.add_argument("--prob-th", type=float, default=0.62)
@@ -697,6 +761,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--time-stop-bars", type=int, default=6)
     parser.add_argument("--session-filter", default="london_ny", choices=["off", "london_only", "ny_only", "london_ny"])
     parser.add_argument("--hour-windows", default="", help="Optional UTC windows, e.g. '7-10,12-16'. Applied in addition to session filter.")
+    parser.add_argument(
+        "--max-trades-per-session",
+        type=int,
+        default=0,
+        help="Cap trades per session bucket. 0 disables cap. With hour windows, bucket=day+window.",
+    )
     parser.add_argument("--regime-filter", default="trend_or_range", choices=["off", "trend_only", "range_only", "trend_or_range"])
     parser.add_argument("--trend-min", type=float, default=0.00010)
     parser.add_argument(
@@ -707,10 +777,16 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--compression-window", type=int, default=720, help="Rolling window bars for range_compression quantile.")
     parser.add_argument(
+        "--atr-norm-min-quantile",
+        type=float,
+        default=0.0,
+        help="Minimum atr_norm rolling quantile threshold for ATR band. Set >0 to enable lower bound.",
+    )
+    parser.add_argument(
         "--atr-norm-max-quantile",
         type=float,
         default=1.0,
-        help="Only allow entries when atr_norm <= rolling quantile threshold. Set <1.0 to enable.",
+        help="Maximum atr_norm rolling quantile threshold for ATR band. Set <1.0 to enable upper bound.",
     )
     parser.add_argument("--atr-window", type=int, default=720, help="Rolling window bars for atr_norm quantile.")
     parser.add_argument(
@@ -748,11 +824,16 @@ def main() -> None:
     df = load_ohlcv_csv(csv_path)
     feat = build_features(df)
     compression_q = float(args.compression_max_quantile)
-    atr_q = float(args.atr_norm_max_quantile)
+    atr_q_min = float(args.atr_norm_min_quantile)
+    atr_q_max = float(args.atr_norm_max_quantile)
     if not (0.0 < compression_q <= 1.0):
         raise ValueError("--compression-max-quantile must be in (0, 1].")
-    if not (0.0 < atr_q <= 1.0):
+    if not (0.0 <= atr_q_min <= 1.0):
+        raise ValueError("--atr-norm-min-quantile must be in [0, 1].")
+    if not (0.0 < atr_q_max <= 1.0):
         raise ValueError("--atr-norm-max-quantile must be in (0, 1].")
+    if atr_q_min > atr_q_max:
+        raise ValueError("--atr-norm-min-quantile cannot be greater than --atr-norm-max-quantile.")
     compression_threshold = (
         rolling_quantile_threshold(
             feat["range_compression"].astype(float),
@@ -762,13 +843,22 @@ def main() -> None:
         if compression_q < 1.0
         else None
     )
-    atr_norm_threshold = (
+    atr_norm_min_threshold = (
         rolling_quantile_threshold(
             feat["atr_norm"].astype(float),
             window=int(args.atr_window),
-            quantile=atr_q,
+            quantile=atr_q_min,
         ).to_numpy(dtype=float)
-        if atr_q < 1.0
+        if atr_q_min > 0.0
+        else None
+    )
+    atr_norm_max_threshold = (
+        rolling_quantile_threshold(
+            feat["atr_norm"].astype(float),
+            window=int(args.atr_window),
+            quantile=atr_q_max,
+        ).to_numpy(dtype=float)
+        if atr_q_max < 1.0
         else None
     )
     horizon = int(args.horizon_bars)
@@ -776,13 +866,26 @@ def main() -> None:
     y_event = make_event_label(df["close"], horizon=horizon, threshold_pips=threshold_pips).to_numpy(dtype=float)
     y_event_int = np.where(np.isnan(y_event), 0, y_event).astype(int)
 
-    splits = walk_forward_splits(
-        df.index,
-        train_years=int(args.train_years),
-        test_months=int(args.test_months),
-        step_months=int(args.step_months),
-        max_folds=int(args.max_folds),
-    )
+    has_lockbox = bool(args.lockbox_train_end or args.lockbox_test_start or args.lockbox_test_end)
+    if has_lockbox:
+        if not (args.lockbox_train_end and args.lockbox_test_start and args.lockbox_test_end):
+            raise ValueError(
+                "Lockbox mode requires all of --lockbox-train-end, --lockbox-test-start, --lockbox-test-end."
+            )
+        splits = lockbox_split(
+            df.index,
+            train_end=str(args.lockbox_train_end),
+            test_start=str(args.lockbox_test_start),
+            test_end=str(args.lockbox_test_end),
+        )
+    else:
+        splits = walk_forward_splits(
+            df.index,
+            train_years=int(args.train_years),
+            test_months=int(args.test_months),
+            step_months=int(args.step_months),
+            max_folds=int(args.max_folds),
+        )
     if not splits:
         raise ValueError("No walk-forward splits produced. Adjust calendar args.")
 
@@ -844,11 +947,13 @@ def main() -> None:
                 time_stop_bars=int(args.time_stop_bars),
                 session_filter=str(args.session_filter),
                 hour_windows=hour_windows,
+                max_trades_per_session=int(args.max_trades_per_session),
                 regime_filter=str(args.regime_filter),
                 trend_min=float(args.trend_min),
                 require_close_confirm=bool(args.require_close_confirm),
                 compression_threshold=compression_threshold,
-                atr_norm_threshold=atr_norm_threshold,
+                atr_norm_min_threshold=atr_norm_min_threshold,
+                atr_norm_max_threshold=atr_norm_max_threshold,
                 lot=float(args.lot),
                 costs=costs,
             )
@@ -875,18 +980,24 @@ def main() -> None:
             "prob_th": float(args.prob_th),
         },
         "walk_forward": {
+            "mode": "lockbox" if has_lockbox else "calendar_walk_forward",
             "train_years": int(args.train_years),
             "test_months": int(args.test_months),
             "step_months": int(args.step_months),
             "folds": int(len(splits)),
+            "lockbox_train_end": str(args.lockbox_train_end) if has_lockbox else "",
+            "lockbox_test_start": str(args.lockbox_test_start) if has_lockbox else "",
+            "lockbox_test_end": str(args.lockbox_test_end) if has_lockbox else "",
         },
         "filters": {
             "session": str(args.session_filter),
             "hour_windows": str(args.hour_windows),
+            "max_trades_per_session": int(args.max_trades_per_session),
             "regime": str(args.regime_filter),
             "trend_min": float(args.trend_min),
             "compression_max_quantile": float(args.compression_max_quantile),
             "compression_window": int(args.compression_window),
+            "atr_norm_min_quantile": float(args.atr_norm_min_quantile),
             "atr_norm_max_quantile": float(args.atr_norm_max_quantile),
             "atr_window": int(args.atr_window),
             "require_close_confirm": bool(args.require_close_confirm),
