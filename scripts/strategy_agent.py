@@ -556,6 +556,7 @@ def main() -> int:
     ap.add_argument("--wf-min-trades-per-fold", type=float, default=DEFAULT_WF_MIN_TRADES_PER_FOLD)
     ap.add_argument("--wf-min-folds-meeting-trades", type=int, default=DEFAULT_WF_MIN_FOLDS_MEETING_TRADES)
     ap.add_argument("--lockbox-min-trades-for-pf", type=float, default=DEFAULT_LOCKBOX_MIN_TRADES_FOR_PF)
+    ap.add_argument("--include-experimental-rlm", action="store_true", help="Include RLM gate candidates (off by default).")
     args = ap.parse_args()
     if float(args.lockbox_min_trades_for_pf) < 0.0:
         raise SystemExit("--lockbox-min-trades-for-pf must be >= 0.")
