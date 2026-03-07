@@ -516,6 +516,7 @@ def render_md(results: List[Dict[str, Any]], meta: Dict[str, Any]) -> str:
         f"- Lockbox: `{meta['lockbox_train_end']}` -> `{meta['lockbox_test_start']}` to `{meta['lockbox_test_end']}`",
         f"- WF sample rule: total_trades>={meta['wf_min_trades_total']} OR (folds_with_trades>={meta['wf_min_folds_meeting_trades']} at >= {meta['wf_min_trades_per_fold']}/fold)",
         f"- Lockbox PF rule: trades>={meta['lockbox_min_trades_for_pf']} required for PF-based robustness",
+        f"- Experimental RLM candidates included: `{bool(meta.get('include_experimental_rlm', False))}`",
         "",
         "| Rank | Strategy | Candidate | Decision | Overall | Stability | Robustness | WF trades | Sample OK | LB PF OK | WF pos_fold | WF PF | WF worst_fold | LB PF | PF25 | PF30 |",
         "| ---: | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
