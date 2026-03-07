@@ -42,6 +42,11 @@ from scripts.vol_breakout_backtest_wf import (
     walk_forward_splits,
 )
 
+DEFAULT_WF_MIN_TRADES_TOTAL = 40.0
+DEFAULT_WF_MIN_TRADES_PER_FOLD = 3.0
+DEFAULT_WF_MIN_FOLDS_MEETING_TRADES = 6
+DEFAULT_LOCKBOX_MIN_TRADES_FOR_PF = 30
+
 
 def utc_now() -> datetime:
     return datetime.now(timezone.utc)
@@ -199,6 +204,7 @@ def collect_trade_events(
     entry_i = -1
     signal_i = -1
     signal_prob = 0.0
+    signal_session_key = ""
 
     for t in range(max(int(lookback), active_start), active_end + 1):
         if t not in active_set:
@@ -279,6 +285,7 @@ def collect_trade_events(
                         "atr_norm": float(atr_norm),
                         "entry_hour_utc": int(entry_hour),
                         "hour_bucket": ny_hour_bucket(entry_hour),
+                        "session_key": str(signal_session_key),
                     }
                 )
                 in_pos = False
@@ -287,6 +294,7 @@ def collect_trade_events(
                 entry_i = -1
                 signal_i = -1
                 signal_prob = 0.0
+                signal_session_key = ""
 
         if in_pos:
             continue
@@ -370,6 +378,7 @@ def collect_trade_events(
         entry_i = int(t1)
         signal_i = int(t)
         signal_prob = float(p)
+        signal_session_key = str(sess_key)
         trades_by_session[sess_key] = int(trades_by_session.get(sess_key, 0)) + 1
 
     return events
@@ -503,10 +512,38 @@ def choose_take_threshold(
     return best_thr, best_rate
 
 
-def actions_from_scores(scores: np.ndarray, threshold: float) -> np.ndarray:
+def actions_from_scores(
+    scores: np.ndarray,
+    threshold: float,
+    events: List[Dict[str, Any]] | None = None,
+    top_k_per_session: int = 0,
+) -> np.ndarray:
     if scores.size == 0:
         return np.zeros((0,), dtype=np.int32)
-    return (np.asarray(scores, dtype=float) >= float(threshold)).astype(np.int32)
+    scores_arr = np.asarray(scores, dtype=float)
+    mask = scores_arr >= float(threshold)
+    if events is None or int(top_k_per_session) <= 0:
+        return mask.astype(np.int32)
+    if len(events) != scores_arr.shape[0]:
+        raise ValueError("scores/events length mismatch")
+
+    k = int(max(1, top_k_per_session))
+    actions = np.zeros((scores_arr.shape[0],), dtype=np.int32)
+    by_session: Dict[str, List[int]] = {}
+    for i, ev in enumerate(events):
+        key = str(ev.get("session_key", "")).strip()
+        if not key:
+            key = f"idx_{i}"
+        by_session.setdefault(key, []).append(i)
+
+    for idxs in by_session.values():
+        eligible = [i for i in idxs if bool(mask[i])]
+        if not eligible:
+            continue
+        eligible.sort(key=lambda i: (-scores_arr[i], i))
+        for i in eligible[:k]:
+            actions[i] = 1
+    return actions
 
 
 def selected_events_from_actions(events: List[Dict[str, Any]], actions: np.ndarray) -> List[Dict[str, Any]]:
@@ -724,8 +761,55 @@ def summarize_rows(rows: pd.DataFrame) -> Dict[str, float | int]:
     }
 
 
+def sample_validity_from_rows(
+    rows: pd.DataFrame,
+    min_total_trades: float,
+    min_trades_per_fold: float,
+    min_folds_meeting_trades: int,
+) -> Dict[str, float | int | bool | str]:
+    if rows.empty:
+        fold_trades = np.zeros((0,), dtype=float)
+    else:
+        fold_trades = rows.groupby("fold")["trades"].sum().to_numpy(dtype=float)
+    trades_total = float(np.sum(fold_trades))
+    folds_meeting = int(np.sum(fold_trades >= float(min_trades_per_fold)))
+    valid_total = bool(trades_total >= float(min_total_trades))
+    valid_fold_depth = bool(folds_meeting >= int(min_folds_meeting_trades))
+    is_sufficient = bool(valid_total or valid_fold_depth)
+    return {
+        "trades_total": trades_total,
+        "fold_count": int(fold_trades.size),
+        "min_fold_trades": float(np.min(fold_trades)) if fold_trades.size else 0.0,
+        "folds_meeting_trades": int(folds_meeting),
+        "valid_total": bool(valid_total),
+        "valid_fold_depth": bool(valid_fold_depth),
+        "is_sufficient": bool(is_sufficient),
+        "status": "SUFFICIENT_SAMPLE" if is_sufficient else "INSUFFICIENT_SAMPLE",
+    }
+
+
+def lockbox_pf_sanity(summary: Dict[str, Any], has_lockbox: bool, min_lockbox_trades: int) -> Dict[str, Any]:
+    trades_total = int(summary.get("trades_total", 0))
+    if not has_lockbox:
+        return {
+            "status": "NOT_LOCKBOX_MODE",
+            "trades_total": trades_total,
+            "min_trades_required": int(min_lockbox_trades),
+            "pf_interpretable": False,
+        }
+    interpretable = trades_total >= int(min_lockbox_trades)
+    return {
+        "status": "LOCKBOX_PF_OK" if interpretable else "LOCKBOX_TOO_FEW_TRADES",
+        "trades_total": trades_total,
+        "min_trades_required": int(min_lockbox_trades),
+        "pf_interpretable": bool(interpretable),
+    }
+
+
 def to_markdown(payload: Dict[str, Any]) -> str:
     s = payload["summaries"].get("base", {})
+    sample = payload.get("sample_validity", {})
+    lockbox_sanity = payload.get("lockbox_sanity", {})
     lines = [
         "# Strategy 1 + RLM Gate (Event-Level) Walk-Forward Report",
         "",
@@ -734,6 +818,7 @@ def to_markdown(payload: Dict[str, Any]) -> str:
         f"- Mode: `{payload['mode']}`",
         f"- Policy: `{payload['rl']['algo']}` | train_timesteps={payload['rl']['train_timesteps']} | min_train_events={payload['rl']['min_train_events']}",
         f"- Gate calibration: target_take_rate={payload['rl']['target_take_rate']:.2f} in [{payload['rl']['take_rate_min']:.2f}, {payload['rl']['take_rate_max']:.2f}]",
+        f"- Gate action rule: top_k_per_session={int(payload['rl'].get('top_k_per_session', 0))} | score_floor=calibrated_threshold",
         f"- Observation: `{'market_features_only' if payload['rl']['market_features_only'] else 'market_plus_trade_state'}`",
         f"- Costs: spread={payload['costs']['spread']}, slippage={payload['costs']['slippage']}, commission={payload['costs']['commission']}",
         "",
@@ -744,6 +829,11 @@ def to_markdown(payload: Dict[str, Any]) -> str:
         f"- PF_mean: `{float(s.get('pf_mean', 0.0)):.3f}` | worst_DD: `{float(s.get('dd_worst', 0.0)):.2f}` | trades_total: `{int(s.get('trades_total', 0))}`",
         f"- take_rate_mean: `{float(s.get('take_rate_mean', 0.0)):.3f}` | edge_per_trade_bps_mean: `{float(s.get('edge_per_trade_bps_mean', 0.0)):.3f}`",
         f"- sample: base_event_count_total=`{int(s.get('base_event_count_total', 0))}` | min_trades_per_fold=`{float(s.get('min_trades_per_fold', 0.0)):.1f}` | folds_trades_ge_3=`{int(s.get('folds_trades_ge_3', 0))}`",
+        (
+            f"- sample_validity: status=`{sample.get('status', 'UNKNOWN')}` | "
+            f"total=`{float(sample.get('trades_total', 0.0)):.0f}/{float(payload.get('validity_rules', {}).get('wf_min_trades_total', 0.0)):.0f}` | "
+            f"folds_meeting=`{int(sample.get('folds_meeting_trades', 0))}/{int(payload.get('validity_rules', {}).get('wf_min_folds_meeting_trades', 0))}`"
+        ),
         "",
         "## Fold Table",
         "",
@@ -756,6 +846,14 @@ def to_markdown(payload: Dict[str, Any]) -> str:
             f"{float(r['take_rate']):.3f} | {float(r['gate_threshold']):.4f} | {int(r['trades'])} | {float(r['net_usd']):.2f} | {float(r['net_bps']):.2f} | "
             f"{float(r['edge_per_trade_bps']):.3f} | {float(r['pf']):.3f} | {float(r['pf_bootstrap_p05']):.3f}/{float(r['pf_bootstrap_p95']):.3f} | {float(r['shuffle_pf_ge_model_prob']):.3f} |"
         )
+    if payload.get("mode") == "lockbox":
+        lines += [
+            "",
+            "## Lockbox Sanity",
+            "",
+            f"- status: `{lockbox_sanity.get('status', 'UNKNOWN')}`",
+            f"- trades_total: `{int(lockbox_sanity.get('trades_total', 0))}` | min_required: `{int(lockbox_sanity.get('min_trades_required', 0))}`",
+        ]
     return "\n".join(lines) + "\n"
 
 
@@ -786,6 +884,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--session-filter", default="london_ny", choices=["off", "london_only", "ny_only", "london_ny"])
     p.add_argument("--hour-windows", default="7-10")
     p.add_argument("--max-trades-per-session", type=int, default=1)
+    p.add_argument(
+        "--candidate-max-trades-per-session",
+        type=int,
+        default=-1,
+        help="Cap for candidate generation before RL gate. -1 uses max-trades-per-session, or unlimited when top-k ranker is enabled.",
+    )
     p.add_argument("--regime-filter", default="trend_or_range", choices=["off", "trend_only", "range_only", "trend_or_range"])
     p.add_argument("--trend-min", type=float, default=0.00010)
     p.add_argument("--compression-max-quantile", type=float, default=0.35)
@@ -810,8 +914,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--rl-target-take-rate", type=float, default=0.30)
     p.add_argument("--rl-take-rate-min", type=float, default=0.15)
     p.add_argument("--rl-take-rate-max", type=float, default=0.60)
+    p.add_argument("--rl-top-k-per-session", type=int, default=0, help="If >0, select up to K highest-scoring eligible events per session.")
     p.add_argument("--rl-bootstrap-samples", type=int, default=400)
     p.add_argument("--rl-sanity-shuffle-trials", type=int, default=200)
+    p.add_argument("--wf-min-trades-total", type=float, default=DEFAULT_WF_MIN_TRADES_TOTAL)
+    p.add_argument("--wf-min-trades-per-fold", type=float, default=DEFAULT_WF_MIN_TRADES_PER_FOLD)
+    p.add_argument("--wf-min-folds-meeting-trades", type=int, default=DEFAULT_WF_MIN_FOLDS_MEETING_TRADES)
+    p.add_argument("--lockbox-min-trades-for-pf", type=int, default=DEFAULT_LOCKBOX_MIN_TRADES_FOR_PF)
     p.add_argument("--market-features-only", dest="market_features_only", action="store_true")
     p.add_argument("--market-plus-trade-state", dest="market_features_only", action="store_false")
     p.set_defaults(market_features_only=True)
@@ -847,6 +956,16 @@ def main() -> int:
         raise ValueError("RL take-rate bounds must be in [0, 1].")
     if float(args.rl_take_rate_min) > float(args.rl_take_rate_max):
         raise ValueError("--rl-take-rate-min cannot exceed --rl-take-rate-max.")
+    if int(args.rl_top_k_per_session) < 0:
+        raise ValueError("--rl-top-k-per-session must be >= 0.")
+    if int(args.candidate_max_trades_per_session) < -1:
+        raise ValueError("--candidate-max-trades-per-session must be -1 or >= 0.")
+    if float(args.wf_min_trades_total) < 0.0 or float(args.wf_min_trades_per_fold) < 0.0:
+        raise ValueError("WF sample-validity thresholds must be >= 0.")
+    if int(args.wf_min_folds_meeting_trades) < 0:
+        raise ValueError("--wf-min-folds-meeting-trades must be >= 0.")
+    if int(args.lockbox_min_trades_for_pf) < 0:
+        raise ValueError("--lockbox-min-trades-for-pf must be >= 0.")
 
     df = load_ohlcv_csv(csv_path)
     feat = build_features(df)
@@ -919,6 +1038,10 @@ def main() -> int:
         take_trade_penalty_bps=float(args.rl_trade_penalty_bps),
         reward_clip_bps=float(args.rl_reward_clip_bps),
     )
+    if int(args.candidate_max_trades_per_session) >= 0:
+        candidate_max_trades_per_session = int(args.candidate_max_trades_per_session)
+    else:
+        candidate_max_trades_per_session = 0 if int(args.rl_top_k_per_session) > 0 else int(args.max_trades_per_session)
 
     runtime_state: Dict[str, Any] = {
         "requested_device": str(args.lgbm_device),
@@ -973,7 +1096,7 @@ def main() -> int:
             time_stop_bars=int(args.time_stop_bars),
             session_filter=str(args.session_filter),
             hour_windows=hour_windows,
-            max_trades_per_session=int(args.max_trades_per_session),
+            max_trades_per_session=int(candidate_max_trades_per_session),
             regime_filter=str(args.regime_filter),
             trend_min=float(args.trend_min),
             require_close_confirm=bool(args.require_close_confirm),
@@ -999,7 +1122,7 @@ def main() -> int:
             time_stop_bars=int(args.time_stop_bars),
             session_filter=str(args.session_filter),
             hour_windows=hour_windows,
-            max_trades_per_session=int(args.max_trades_per_session),
+            max_trades_per_session=int(candidate_max_trades_per_session),
             regime_filter=str(args.regime_filter),
             trend_min=float(args.trend_min),
             require_close_confirm=bool(args.require_close_confirm),
@@ -1014,29 +1137,38 @@ def main() -> int:
         test_obs = build_observation_matrix(test_events, market_features_only=bool(args.market_features_only))
         train_obs, test_obs = normalize_train_test_obs(train_obs, test_obs)
         train_rewards_bps = np.asarray([float(ev["pnl_bps"]) for ev in train_events], dtype=np.float32)
+        fold_seed = int(args.rl_seed) + int(fold_num)
 
         model: PPO | A2C | None = None
         policy_path = ""
         gate_threshold = 0.5
         train_take_rate_before_calib = 1.0
         train_take_rate_after_calib = 1.0
+        train_take_rate_after_calib_raw = 1.0
         if train_events and len(train_events) >= int(args.rl_min_train_events):
             model = train_gate_policy(
                 observations=train_obs,
                 rewards_bps=train_rewards_bps,
                 algo=str(args.rl_algo),
                 total_timesteps=int(args.rl_train_timesteps),
-                seed=int(args.rl_seed),
+                seed=fold_seed,
                 reward_cfg=reward_cfg,
             )
             train_scores = extract_take_scores(model, train_obs)
             train_take_rate_before_calib = float(np.mean(train_scores >= 0.5)) if train_scores.size else 0.0
-            gate_threshold, train_take_rate_after_calib = choose_take_threshold(
+            gate_threshold, train_take_rate_after_calib_raw = choose_take_threshold(
                 train_scores=train_scores,
                 target_take_rate=float(args.rl_target_take_rate),
                 take_rate_min=float(args.rl_take_rate_min),
                 take_rate_max=float(args.rl_take_rate_max),
             )
+            train_actions = actions_from_scores(
+                train_scores,
+                gate_threshold,
+                events=train_events,
+                top_k_per_session=int(args.rl_top_k_per_session),
+            )
+            train_take_rate_after_calib = float(np.mean(train_actions.astype(float))) if train_actions.size else 0.0
             if args.save_fold_policies:
                 path = policy_dir / f"{args.out_prefix}_fold{fold_num:02d}.zip"
                 model.save(str(path))
@@ -1047,14 +1179,19 @@ def main() -> int:
         eval_events = train_events if bool(args.train_only) else test_events
         eval_obs = train_obs if bool(args.train_only) else test_obs
         eval_scores = extract_take_scores(model, eval_obs)
-        actions = actions_from_scores(eval_scores, gate_threshold)
+        actions = actions_from_scores(
+            eval_scores,
+            gate_threshold,
+            events=eval_events,
+            top_k_per_session=int(args.rl_top_k_per_session),
+        )
         selected_metrics = metrics_from_actions(eval_events, actions)
         selected_events = selected_events_from_actions(eval_events, actions)
         selected_trade_pnls = np.asarray([float(ev.get("pnl_usd", 0.0)) for ev in selected_events], dtype=float)
         pf_boot = bootstrap_pf_confidence(
             selected_trade_pnls,
             n_boot=int(args.rl_bootstrap_samples),
-            seed=int(args.rl_seed) + int(fold_num),
+            seed=fold_seed,
         )
         attrib = regime_attribution(
             selected_events=selected_events,
@@ -1065,7 +1202,7 @@ def main() -> int:
             all_events=eval_events,
             take_count=int(selected_metrics["trades"]),
             n_trials=int(args.rl_sanity_shuffle_trials),
-            seed=int(args.rl_seed) + int(fold_num),
+            seed=fold_seed,
             model_pf=float(selected_metrics["pf"]),
         )
         base_actions = np.ones((len(eval_events),), dtype=np.int32)
@@ -1074,6 +1211,7 @@ def main() -> int:
             {
                 "mode": "lockbox" if has_lockbox else "wf",
                 "fold": int(fold_num),
+                "fold_seed": int(fold_seed),
                 "train_start": str(df.index[int(tr_idx[0])]),
                 "train_end": str(df.index[int(tr_idx[-1])]),
                 "test_start": str(df.index[int(te_idx[0])]),
@@ -1087,6 +1225,7 @@ def main() -> int:
                 "gate_threshold": float(gate_threshold),
                 "train_take_rate_before_calib": float(train_take_rate_before_calib),
                 "train_take_rate_after_calib": float(train_take_rate_after_calib),
+                "train_take_rate_after_calib_raw": float(train_take_rate_after_calib_raw),
                 "base_event_count": int(len(eval_events)),
                 "take_rate": float(selected_metrics["take_rate"]),
                 "trades": int(selected_metrics["trades"]),
@@ -1108,13 +1247,43 @@ def main() -> int:
                 "base_max_dd_usd": float(base_metrics["max_dd_usd"]),
             }
         )
-        print(f"fold {fold_num:02d}/{len(splits)} done")
+        print(
+            f"fold {fold_num:02d}/{len(splits)} done "
+            f"take_rate={float(selected_metrics['take_rate']):.3f} trades={int(selected_metrics['trades'])} "
+            f"train_take_rate={float(train_take_rate_after_calib):.3f} "
+            f"shuffle_pf_ge_model_prob={float(sanity.get('shuffle_pf_ge_model_prob', float('nan'))):.3f}"
+        )
 
     rows_df = pd.DataFrame(fold_rows)
+    base_summary = summarize_rows(rows_df)
+    sample_validity = sample_validity_from_rows(
+        rows_df,
+        min_total_trades=float(args.wf_min_trades_total),
+        min_trades_per_fold=float(args.wf_min_trades_per_fold),
+        min_folds_meeting_trades=int(args.wf_min_folds_meeting_trades),
+    )
+    lockbox_sanity = lockbox_pf_sanity(
+        summary=base_summary,
+        has_lockbox=bool(has_lockbox),
+        min_lockbox_trades=int(args.lockbox_min_trades_for_pf),
+    )
+    status_flags: List[str] = []
+    if str(sample_validity.get("status")) == "INSUFFICIENT_SAMPLE":
+        status_flags.append("INSUFFICIENT_SAMPLE")
+    if str(lockbox_sanity.get("status")) == "LOCKBOX_TOO_FEW_TRADES":
+        status_flags.append("LOCKBOX_TOO_FEW_TRADES")
+
     payload = {
         "generated_utc": utc_now().isoformat(),
         "data_csv": str(csv_path.resolve()),
         "mode": "lockbox" if has_lockbox else "wf",
+        "status_flags": status_flags,
+        "validity_rules": {
+            "wf_min_trades_total": float(args.wf_min_trades_total),
+            "wf_min_trades_per_fold": float(args.wf_min_trades_per_fold),
+            "wf_min_folds_meeting_trades": int(args.wf_min_folds_meeting_trades),
+            "lockbox_min_trades_for_pf": int(args.lockbox_min_trades_for_pf),
+        },
         "event": {
             "horizon_bars": int(args.horizon_bars),
             "move_threshold_pips": float(args.move_threshold_pips),
@@ -1133,6 +1302,7 @@ def main() -> int:
             "session": str(args.session_filter),
             "hour_windows": str(args.hour_windows),
             "max_trades_per_session": int(args.max_trades_per_session),
+            "candidate_max_trades_per_session": int(candidate_max_trades_per_session),
             "regime": str(args.regime_filter),
             "trend_min": float(args.trend_min),
             "compression_max_quantile": float(args.compression_max_quantile),
@@ -1177,6 +1347,7 @@ def main() -> int:
             "target_take_rate": float(args.rl_target_take_rate),
             "take_rate_min": float(args.rl_take_rate_min),
             "take_rate_max": float(args.rl_take_rate_max),
+            "top_k_per_session": int(args.rl_top_k_per_session),
             "bootstrap_samples": int(args.rl_bootstrap_samples),
             "sanity_shuffle_trials": int(args.rl_sanity_shuffle_trials),
             "market_features_only": bool(args.market_features_only),
@@ -1185,7 +1356,9 @@ def main() -> int:
             "train_only": bool(args.train_only),
         },
         "fold_rows": fold_rows,
-        "summaries": {"base": summarize_rows(rows_df)},
+        "summaries": {"base": base_summary},
+        "sample_validity": sample_validity,
+        "lockbox_sanity": lockbox_sanity,
         "params": vars(args),
     }
 
@@ -1198,6 +1371,21 @@ def main() -> int:
     md_path.write_text(to_markdown(payload), encoding="utf-8")
 
     print("=== DONE ===")
+    print(
+        "sample_validity "
+        f"status={payload['sample_validity']['status']} "
+        f"trades_total={float(payload['sample_validity']['trades_total']):.0f} "
+        f"folds_meeting={int(payload['sample_validity']['folds_meeting_trades'])}"
+    )
+    if payload["mode"] == "lockbox":
+        print(
+            "lockbox_sanity "
+            f"status={payload['lockbox_sanity']['status']} "
+            f"trades_total={int(payload['lockbox_sanity']['trades_total'])} "
+            f"min_required={int(payload['lockbox_sanity']['min_trades_required'])}"
+        )
+    for flag in payload.get("status_flags", []):
+        print(flag)
     print(
         "model_runtime "
         f"requested_device={payload['model_runtime']['requested_device']} "

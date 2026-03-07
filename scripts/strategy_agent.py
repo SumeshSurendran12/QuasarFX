@@ -15,6 +15,7 @@ BOOL_FLAG_KEYS = {"--require-close-confirm"}
 DEFAULT_WF_MIN_TRADES_TOTAL = 40.0
 DEFAULT_WF_MIN_TRADES_PER_FOLD = 3.0
 DEFAULT_WF_MIN_FOLDS_MEETING_TRADES = 6
+DEFAULT_LOCKBOX_MIN_TRADES_FOR_PF = 30
 
 
 def now_iso() -> str:
@@ -227,6 +228,21 @@ def normalize_lockbox(report: Optional[Dict[str, Any]]) -> Dict[str, float]:
         "trades": safe_float(report.get("trades", report.get("trades_total"))),
     }
 
+
+def lockbox_pf_validity(
+    lockbox_report: Optional[Dict[str, Any]],
+    min_lockbox_trades: float = DEFAULT_LOCKBOX_MIN_TRADES_FOR_PF,
+) -> Dict[str, float | str]:
+    lb = normalize_lockbox(lockbox_report)
+    trades = safe_float(lb.get("trades"))
+    ok = trades >= float(min_lockbox_trades)
+    return {
+        "trades": float(trades),
+        "min_trades_required": float(min_lockbox_trades),
+        "is_sufficient": 1.0 if ok else 0.0,
+        "status": "LOCKBOX_PF_OK" if ok else "LOCKBOX_TOO_FEW_TRADES",
+    }
+
 def stability_score(wf_report: Optional[Dict[str, Any]]) -> float:
     m = normalize_wf(wf_report)
     pos = clamp(m["pos_fold_rate"], 0.0, 1.0)
@@ -254,7 +270,14 @@ def sample_penalty(
     return -50.0
 
 
-def robustness_score(lockbox_base_report: Optional[Dict[str, Any]], stress_reports: Dict[str, Optional[Dict[str, Any]]]) -> float:
+def robustness_score(
+    lockbox_base_report: Optional[Dict[str, Any]],
+    stress_reports: Dict[str, Optional[Dict[str, Any]]],
+    min_lockbox_trades: float = DEFAULT_LOCKBOX_MIN_TRADES_FOR_PF,
+) -> float:
+    lb_valid = lockbox_pf_validity(lockbox_base_report, min_lockbox_trades=min_lockbox_trades)
+    if lb_valid["is_sufficient"] < 0.5:
+        return 0.0
     b = normalize_lockbox(lockbox_base_report)
     base_pf = b["pf"]
     base_net = b["net"]
@@ -282,6 +305,7 @@ def gate_decision(
     min_total_trades: float = DEFAULT_WF_MIN_TRADES_TOTAL,
     min_trades_per_fold: float = DEFAULT_WF_MIN_TRADES_PER_FOLD,
     min_folds_meeting_trades: int = DEFAULT_WF_MIN_FOLDS_MEETING_TRADES,
+    min_lockbox_trades: float = DEFAULT_LOCKBOX_MIN_TRADES_FOR_PF,
 ) -> str:
     if not wf_report or not lockbox_base_report:
         return "INCOMPLETE"
@@ -293,6 +317,9 @@ def gate_decision(
     )
     if sample["is_sufficient"] < 0.5:
         return "INSUFFICIENT_SAMPLE"
+    lb_valid = lockbox_pf_validity(lockbox_base_report, min_lockbox_trades=min_lockbox_trades)
+    if lb_valid["is_sufficient"] < 0.5:
+        return "LOCKBOX_TOO_FEW_TRADES"
     wf = normalize_wf(wf_report)
     lb = normalize_lockbox(lockbox_base_report)
     pf25 = normalize_lockbox(stress_reports.get("spread25_slip2x"))["pf"]
@@ -317,6 +344,7 @@ def suggest_patch(
     min_total_trades: float = DEFAULT_WF_MIN_TRADES_TOTAL,
     min_trades_per_fold: float = DEFAULT_WF_MIN_TRADES_PER_FOLD,
     min_folds_meeting_trades: int = DEFAULT_WF_MIN_FOLDS_MEETING_TRADES,
+    min_lockbox_trades: float = DEFAULT_LOCKBOX_MIN_TRADES_FOR_PF,
 ) -> str:
     if not wf_report or not lockbox_base_report:
         return "Add lockbox support and ensure report_json is emitted."
@@ -328,6 +356,9 @@ def suggest_patch(
     )
     if sample["is_sufficient"] < 0.5:
         return "Insufficient WF sample: increase trade count or calibrate gate to train take-rate band (0.15-0.60)."
+    lb_valid = lockbox_pf_validity(lockbox_base_report, min_lockbox_trades=min_lockbox_trades)
+    if lb_valid["is_sufficient"] < 0.5:
+        return "LOCKBOX_TOO_FEW_TRADES: do not infer robustness PF until lockbox trades >= 30."
     wf = normalize_wf(wf_report)
     lb = normalize_lockbox(lockbox_base_report)
     pf25 = normalize_lockbox(stress_reports.get("spread25_slip2x"))["pf"]
@@ -484,18 +515,20 @@ def render_md(results: List[Dict[str, Any]], meta: Dict[str, Any]) -> str:
         f"- Data: `{meta['data_csv']}`",
         f"- Lockbox: `{meta['lockbox_train_end']}` -> `{meta['lockbox_test_start']}` to `{meta['lockbox_test_end']}`",
         f"- WF sample rule: total_trades>={meta['wf_min_trades_total']} OR (folds_with_trades>={meta['wf_min_folds_meeting_trades']} at >= {meta['wf_min_trades_per_fold']}/fold)",
+        f"- Lockbox PF rule: trades>={meta['lockbox_min_trades_for_pf']} required for PF-based robustness",
         "",
-        "| Rank | Strategy | Candidate | Decision | Overall | Stability | Robustness | WF trades | Sample OK | WF pos_fold | WF PF | WF worst_fold | LB PF | PF25 | PF30 |",
-        "| ---: | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+        "| Rank | Strategy | Candidate | Decision | Overall | Stability | Robustness | WF trades | Sample OK | LB PF OK | WF pos_fold | WF PF | WF worst_fold | LB PF | PF25 | PF30 |",
+        "| ---: | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
     ]
     for i, r in enumerate(results, 1):
         wm = r["wf_metrics"] or {}
         ws = r.get("wf_sample") or {}
         lb = r["lockbox_base_metrics"] or {}
+        lbs = r.get("lockbox_sample") or {}
         s25 = (r["lockbox_stress_metrics"] or {}).get("spread25_slip2x") or {}
         s30 = (r["lockbox_stress_metrics"] or {}).get("spread30_slip2x") or {}
         lines.append(
-            f"| {i} | {r['strategy']} | {r['candidate']} | **{r['decision']}** | {r['scores']['overall']:.2f} | {r['scores']['stability']:.2f} | {r['scores']['robustness']:.2f} | {safe_float(wm.get('trades_total')):.0f} | {bool(ws.get('is_sufficient', 0.0) >= 0.5)} | {safe_float(wm.get('pos_fold_rate')):.2f} | {safe_float(wm.get('pf_mean')):.3f} | {safe_float(wm.get('worst_fold_net')):.2f} | {safe_float(lb.get('pf')):.3f} | {safe_float(s25.get('pf')):.3f} | {safe_float(s30.get('pf')):.3f} |"
+            f"| {i} | {r['strategy']} | {r['candidate']} | **{r['decision']}** | {r['scores']['overall']:.2f} | {r['scores']['stability']:.2f} | {r['scores']['robustness']:.2f} | {safe_float(wm.get('trades_total')):.0f} | {bool(ws.get('is_sufficient', 0.0) >= 0.5)} | {bool(lbs.get('is_sufficient', 0.0) >= 0.5)} | {safe_float(wm.get('pos_fold_rate')):.2f} | {safe_float(wm.get('pf_mean')):.3f} | {safe_float(wm.get('worst_fold_net')):.2f} | {safe_float(lb.get('pf')):.3f} | {safe_float(s25.get('pf')):.3f} | {safe_float(s30.get('pf')):.3f} |"
         )
     lines += ["", "## Next Patches", ""]
     for r in results:
@@ -522,7 +555,10 @@ def main() -> int:
     ap.add_argument("--wf-min-trades-total", type=float, default=DEFAULT_WF_MIN_TRADES_TOTAL)
     ap.add_argument("--wf-min-trades-per-fold", type=float, default=DEFAULT_WF_MIN_TRADES_PER_FOLD)
     ap.add_argument("--wf-min-folds-meeting-trades", type=int, default=DEFAULT_WF_MIN_FOLDS_MEETING_TRADES)
+    ap.add_argument("--lockbox-min-trades-for-pf", type=float, default=DEFAULT_LOCKBOX_MIN_TRADES_FOR_PF)
     args = ap.parse_args()
+    if float(args.lockbox_min_trades_for_pf) < 0.0:
+        raise SystemExit("--lockbox-min-trades-for-pf must be >= 0.")
 
     repo_root = Path(args.repo_root).resolve()
     data_csv = Path(args.data_csv).resolve()
@@ -546,6 +582,7 @@ def main() -> int:
         "wf_min_trades_total": args.wf_min_trades_total,
         "wf_min_trades_per_fold": args.wf_min_trades_per_fold,
         "wf_min_folds_meeting_trades": args.wf_min_folds_meeting_trades,
+        "lockbox_min_trades_for_pf": args.lockbox_min_trades_for_pf,
     }
 
     ranked: List[Dict[str, Any]] = []
@@ -609,13 +646,21 @@ def main() -> int:
                 min_trades_per_fold=float(args.wf_min_trades_per_fold),
                 min_folds_meeting_trades=int(args.wf_min_folds_meeting_trades),
             )
+            lb_sample = lockbox_pf_validity(
+                lb_base,
+                min_lockbox_trades=float(args.lockbox_min_trades_for_pf),
+            )
             stab = stability_score(wf_json) + sample_penalty(
                 wf_json,
                 min_total_trades=float(args.wf_min_trades_total),
                 min_trades_per_fold=float(args.wf_min_trades_per_fold),
                 min_folds_meeting_trades=int(args.wf_min_folds_meeting_trades),
             )
-            rob = robustness_score(lb_base, lb_stress)
+            rob = robustness_score(
+                lb_base,
+                lb_stress,
+                min_lockbox_trades=float(args.lockbox_min_trades_for_pf),
+            )
             ov = overall_score(stab, rob)
             dec = gate_decision(
                 wf_json,
@@ -624,6 +669,7 @@ def main() -> int:
                 min_total_trades=float(args.wf_min_trades_total),
                 min_trades_per_fold=float(args.wf_min_trades_per_fold),
                 min_folds_meeting_trades=int(args.wf_min_folds_meeting_trades),
+                min_lockbox_trades=float(args.lockbox_min_trades_for_pf),
             )
             nxt = suggest_patch(
                 strategy,
@@ -633,6 +679,7 @@ def main() -> int:
                 min_total_trades=float(args.wf_min_trades_total),
                 min_trades_per_fold=float(args.wf_min_trades_per_fold),
                 min_folds_meeting_trades=int(args.wf_min_folds_meeting_trades),
+                min_lockbox_trades=float(args.lockbox_min_trades_for_pf),
             )
 
             ranked.append(
@@ -643,6 +690,7 @@ def main() -> int:
                     "scores": {"stability": stab, "robustness": rob, "overall": ov},
                     "wf_metrics": normalize_wf(wf_json),
                     "wf_sample": wf_sample,
+                    "lockbox_sample": lb_sample,
                     "lockbox_base_metrics": normalize_lockbox(lb_base),
                     "lockbox_stress_metrics": {k: normalize_lockbox(v) for k, v in lb_stress.items()},
                     "next_patch": nxt,
@@ -655,6 +703,7 @@ def main() -> int:
         "STABLE_ONLY": 4,
         "LOCKBOX_ONLY": 3,
         "FAIL": 2,
+        "LOCKBOX_TOO_FEW_TRADES": 1,
         "INSUFFICIENT_SAMPLE": 1,
         "INCOMPLETE": 0,
     }
