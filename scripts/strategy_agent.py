@@ -570,6 +570,10 @@ def main() -> int:
     candidates = DEFAULT_CANDIDATES
     if args.candidates_json:
         candidates = read_json(Path(args.candidates_json).resolve())
+    elif bool(args.include_experimental_rlm):
+        for k, items in EXPERIMENTAL_CANDIDATES.items():
+            candidates.setdefault(k, [])
+            candidates[k].extend(items)
 
     meta = {
         "generated_utc": now_iso(),
@@ -583,6 +587,7 @@ def main() -> int:
         "wf_min_trades_per_fold": args.wf_min_trades_per_fold,
         "wf_min_folds_meeting_trades": args.wf_min_folds_meeting_trades,
         "lockbox_min_trades_for_pf": args.lockbox_min_trades_for_pf,
+        "include_experimental_rlm": bool(args.include_experimental_rlm),
     }
 
     ranked: List[Dict[str, Any]] = []
