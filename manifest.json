@@ -1,0 +1,73 @@
+{
+  "manifest_id": "strategy_1_manifest_v1",
+  "created_utc": "2026-03-07T00:00:00+00:00",
+  "strategy_id": "strategy_1",
+  "stage": "PAPER_CANDIDATE",
+  "promotion_target": "LIVE_GATED",
+  "branch_stages": {
+    "strategy_2_deterministic": "RESEARCH",
+    "rlm_rl": "EXPERIMENTAL_ONLY"
+  },
+  "frozen_parameters": {
+    "script": "scripts/vol_breakout_backtest_wf.py",
+    "horizon_bars": 6,
+    "move_threshold_pips": 40.0,
+    "prob_th": 0.62,
+    "exec_mode": "conservative",
+    "train_years": 3,
+    "test_months": 6,
+    "step_months": 6,
+    "session_filter": "london_ny",
+    "hour_windows": "7-10",
+    "regime_filter": "trend_or_range",
+    "trend_min": 0.0001,
+    "lookback": 24,
+    "buffer_pips": 1.0,
+    "sl_pips": 12.0,
+    "tp_pips": 24.0,
+    "time_stop_bars": 12,
+    "compression_max_quantile": 0.35,
+    "compression_window": 24,
+    "atr_norm_max_quantile": 0.6,
+    "atr_window": 24,
+    "require_close_confirm": true
+  },
+  "controls": {
+    "live_spread_gate_active": true,
+    "live_max_spread_pips": 2.2,
+    "live_max_spread": 0.00022,
+    "max_trades_per_session": 1
+  },
+  "kill_switch": {
+    "spread_too_high": {
+      "enabled": true,
+      "max_spread": 0.00022,
+      "trigger_on_entry_violation_count_ge": 1
+    },
+    "too_many_skipped_bars": {
+      "enabled": true,
+      "max_consecutive_skipped_bars": 120
+    },
+    "broker_api_failure": {
+      "enabled": true,
+      "max_consecutive_failures": 3
+    },
+    "daily_drawdown_breach": {
+      "enabled": true,
+      "max_daily_drawdown_usd": 120.0
+    }
+  },
+  "event_contract": {
+    "schema_path": "schemas/strategy_1_events.schema.json",
+    "events_file": "events.jsonl",
+    "daily_summary_file": "daily_summary.json",
+    "required_common_fields": [
+      "ts",
+      "run_id",
+      "event",
+      "stage",
+      "strategy_id",
+      "profile_hash"
+    ]
+  }
+}

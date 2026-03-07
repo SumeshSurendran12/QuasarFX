@@ -1,0 +1,296 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.local/schemas/strategy_1_events.schema.json",
+  "title": "Strategy 1 Canonical Events JSONL Record",
+  "type": "object",
+  "required": [
+    "ts",
+    "run_id",
+    "event",
+    "stage",
+    "strategy_id",
+    "profile_hash"
+  ],
+  "properties": {
+    "ts": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "run_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "event": {
+      "type": "string",
+      "enum": [
+        "session_start",
+        "signal_evaluated",
+        "trade_skipped",
+        "order_submitted",
+        "order_filled",
+        "position_closed",
+        "daily_risk_update",
+        "health_status",
+        "kill_switch_check",
+        "kill_switch_triggered",
+        "session_end"
+      ]
+    },
+    "stage": {
+      "type": "string",
+      "enum": [
+        "RESEARCH",
+        "PAPER_CANDIDATE",
+        "LIVE_GATED",
+        "PRODUCTION",
+        "EXPERIMENTAL_ONLY"
+      ]
+    },
+    "strategy_id": {
+      "type": "string",
+      "const": "strategy_1"
+    },
+    "profile_hash": {
+      "type": "string",
+      "pattern": "^sha256:[a-fA-F0-9]{64}$"
+    },
+    "reason_code": {
+      "type": "string",
+      "enum": [
+        "signal_pass",
+        "spread_gate",
+        "session_cap",
+        "daily_loss_limit",
+        "max_open_positions",
+        "outside_session",
+        "cooldown_active",
+        "duplicate_signal",
+        "no_liquidity",
+        "manual_disable",
+        "policy_breach",
+        "within_limits",
+        "broker_api_failure"
+      ]
+    },
+    "trade_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "symbol": {
+      "type": "string",
+      "minLength": 1
+    },
+    "bar_ts": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "side": {
+      "type": "string",
+      "enum": [
+        "long",
+        "short"
+      ]
+    },
+    "decision": {
+      "type": "string"
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "event": {
+            "const": "session_start"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "symbol",
+          "mode"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "event": {
+            "const": "signal_evaluated"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "symbol",
+          "bar_ts",
+          "side",
+          "decision",
+          "reason_code"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "event": {
+            "const": "trade_skipped"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "symbol",
+          "bar_ts",
+          "side",
+          "decision",
+          "reason_code"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "event": {
+            "const": "order_submitted"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "symbol",
+          "trade_id",
+          "side",
+          "qty",
+          "order_type"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "event": {
+            "const": "order_filled"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "symbol",
+          "trade_id",
+          "side",
+          "qty",
+          "fill_price"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "event": {
+            "const": "position_closed"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "symbol",
+          "trade_id",
+          "exit_reason",
+          "entry_price",
+          "exit_price",
+          "pnl_usd",
+          "hold_seconds"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "event": {
+            "const": "daily_risk_update"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "symbol",
+          "trades_today",
+          "wins",
+          "losses",
+          "net_pnl_usd",
+          "gross_profit_usd",
+          "gross_loss_usd",
+          "profit_factor",
+          "max_drawdown_usd",
+          "spread_gate_skips",
+          "session_cap_skips"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "event": {
+            "const": "health_status"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "status",
+          "event_log_present",
+          "kill_switch_armed",
+          "kill_switch_triggered"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "event": {
+            "const": "kill_switch_check"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "status",
+          "reason_code"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "event": {
+            "const": "kill_switch_triggered"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "status",
+          "reason_code"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "event": {
+            "const": "session_end"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "symbol",
+          "trades",
+          "net_pnl_usd",
+          "status"
+        ]
+      }
+    }
+  ],
+  "additionalProperties": true
+}
