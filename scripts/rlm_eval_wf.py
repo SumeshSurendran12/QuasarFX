@@ -46,6 +46,12 @@ DEFAULT_WF_MIN_TRADES_TOTAL = 40.0
 DEFAULT_WF_MIN_TRADES_PER_FOLD = 3.0
 DEFAULT_WF_MIN_FOLDS_MEETING_TRADES = 6
 DEFAULT_LOCKBOX_MIN_TRADES_FOR_PF = 30
+DEPLOYMENT_LABELS: Dict[str, str] = {
+    "strategy_1": "PAPER_CANDIDATE",
+    "strategy_2_deterministic": "RESEARCH",
+    "rlm_rl": "EXPERIMENTAL_ONLY",
+    "promotion_target": "LIVE_GATED",
+}
 
 
 def utc_now() -> datetime:
@@ -816,6 +822,10 @@ def to_markdown(payload: Dict[str, Any]) -> str:
         f"- Generated (UTC): `{payload['generated_utc']}`",
         f"- Data: `{payload['data_csv']}`",
         f"- Mode: `{payload['mode']}`",
+        f"- Strategy 1 stage: `{payload.get('deployment_labels', {}).get('strategy_1', '')}`",
+        f"- Strategy 2 deterministic stage: `{payload.get('deployment_labels', {}).get('strategy_2_deterministic', '')}`",
+        f"- RLM/RL stage: `{payload.get('deployment_labels', {}).get('rlm_rl', '')}`",
+        f"- Promotion target after paper checks: `{payload.get('deployment_labels', {}).get('promotion_target', '')}`",
         f"- Policy: `{payload['rl']['algo']}` | train_timesteps={payload['rl']['train_timesteps']} | min_train_events={payload['rl']['min_train_events']}",
         f"- Gate calibration: target_take_rate={payload['rl']['target_take_rate']:.2f} in [{payload['rl']['take_rate_min']:.2f}, {payload['rl']['take_rate_max']:.2f}]",
         f"- Gate action rule: top_k_per_session={int(payload['rl'].get('top_k_per_session', 0))} | score_floor=calibrated_threshold",
@@ -1277,6 +1287,7 @@ def main() -> int:
         "generated_utc": utc_now().isoformat(),
         "data_csv": str(csv_path.resolve()),
         "mode": "lockbox" if has_lockbox else "wf",
+        "deployment_labels": dict(DEPLOYMENT_LABELS),
         "status_flags": status_flags,
         "validity_rules": {
             "wf_min_trades_total": float(args.wf_min_trades_total),

@@ -17,6 +17,13 @@ DEFAULT_WF_MIN_TRADES_PER_FOLD = 3.0
 DEFAULT_WF_MIN_FOLDS_MEETING_TRADES = 6
 DEFAULT_LOCKBOX_MIN_TRADES_FOR_PF = 30
 
+DEPLOYMENT_STAGE_MAP: Dict[str, str] = {
+    "strategy_1": "PAPER_CANDIDATE",
+    "strategy_2_deterministic": "RESEARCH",
+    "rlm_rl": "EXPERIMENTAL_ONLY",
+    "promotion_target": "LIVE_GATED",
+}
+
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -483,6 +490,15 @@ def build_cmd(python_exe: str, script: Path, data_csv: Path, out_prefix: str, ex
     return cmd
 
 
+def candidate_stage(strategy_key: str, script_path: Path) -> str:
+    n = script_path.name.lower()
+    if n == "rlm_eval_wf.py":
+        return DEPLOYMENT_STAGE_MAP["rlm_rl"]
+    if strategy_key == "strategy_1":
+        return DEPLOYMENT_STAGE_MAP["strategy_1"]
+    return DEPLOYMENT_STAGE_MAP["strategy_2_deterministic"]
+
+
 def run_one(kind: str, strategy: str, candidate: str, cmd: List[str], cwd: Path, logs_dir: Path, out_prefix: str, reports_dir: Path) -> Tuple[Dict[str, Any], Optional[Dict[str, Any]]]:
     ensure_dir(logs_dir)
     rc, out = run_cmd(cmd, cwd)
@@ -522,9 +538,13 @@ def render_md(results: List[Dict[str, Any]], meta: Dict[str, Any]) -> str:
         f"- WF sample rule: total_trades>={meta['wf_min_trades_total']} OR (folds_with_trades>={meta['wf_min_folds_meeting_trades']} at >= {meta['wf_min_trades_per_fold']}/fold)",
         f"- Lockbox PF rule: trades>={meta['lockbox_min_trades_for_pf']} required for PF-based robustness",
         f"- Experimental RLM candidates included: `{bool(meta.get('include_experimental_rlm', False))}`",
+        f"- Strategy 1 stage: `{meta['deployment_stages']['strategy_1']}`",
+        f"- Strategy 2 deterministic stage: `{meta['deployment_stages']['strategy_2_deterministic']}`",
+        f"- RLM/RL stage: `{meta['deployment_stages']['rlm_rl']}`",
+        f"- Promotion target after paper checks: `{meta['deployment_stages']['promotion_target']}`",
         "",
-        "| Rank | Strategy | Candidate | Decision | Overall | Stability | Robustness | WF trades | Sample OK | LB PF OK | WF pos_fold | WF PF | WF worst_fold | LB PF | PF25 | PF30 |",
-        "| ---: | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+        "| Rank | Strategy | Candidate | Stage | Decision | Overall | Stability | Robustness | WF trades | Sample OK | LB PF OK | WF pos_fold | WF PF | WF worst_fold | LB PF | PF25 | PF30 |",
+        "| ---: | --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
     ]
     for i, r in enumerate(results, 1):
         wm = r["wf_metrics"] or {}
@@ -534,7 +554,7 @@ def render_md(results: List[Dict[str, Any]], meta: Dict[str, Any]) -> str:
         s25 = (r["lockbox_stress_metrics"] or {}).get("spread25_slip2x") or {}
         s30 = (r["lockbox_stress_metrics"] or {}).get("spread30_slip2x") or {}
         lines.append(
-            f"| {i} | {r['strategy']} | {r['candidate']} | **{r['decision']}** | {r['scores']['overall']:.2f} | {r['scores']['stability']:.2f} | {r['scores']['robustness']:.2f} | {safe_float(wm.get('trades_total')):.0f} | {bool(ws.get('is_sufficient', 0.0) >= 0.5)} | {bool(lbs.get('is_sufficient', 0.0) >= 0.5)} | {safe_float(wm.get('pos_fold_rate')):.2f} | {safe_float(wm.get('pf_mean')):.3f} | {safe_float(wm.get('worst_fold_net')):.2f} | {safe_float(lb.get('pf')):.3f} | {safe_float(s25.get('pf')):.3f} | {safe_float(s30.get('pf')):.3f} |"
+            f"| {i} | {r['strategy']} | {r['candidate']} | {r.get('stage', '')} | **{r['decision']}** | {r['scores']['overall']:.2f} | {r['scores']['stability']:.2f} | {r['scores']['robustness']:.2f} | {safe_float(wm.get('trades_total')):.0f} | {bool(ws.get('is_sufficient', 0.0) >= 0.5)} | {bool(lbs.get('is_sufficient', 0.0) >= 0.5)} | {safe_float(wm.get('pos_fold_rate')):.2f} | {safe_float(wm.get('pf_mean')):.3f} | {safe_float(wm.get('worst_fold_net')):.2f} | {safe_float(lb.get('pf')):.3f} | {safe_float(s25.get('pf')):.3f} | {safe_float(s30.get('pf')):.3f} |"
         )
     lines += ["", "## Next Patches", ""]
     for r in results:
@@ -595,6 +615,7 @@ def main() -> int:
         "wf_min_folds_meeting_trades": args.wf_min_folds_meeting_trades,
         "lockbox_min_trades_for_pf": args.lockbox_min_trades_for_pf,
         "include_experimental_rlm": bool(args.include_experimental_rlm),
+        "deployment_stages": dict(DEPLOYMENT_STAGE_MAP),
     }
 
     ranked: List[Dict[str, Any]] = []
@@ -605,6 +626,7 @@ def main() -> int:
         for item in items:
             name = str(item["name"])
             script = (repo_root / str(item["script"])).resolve()
+            stage = candidate_stage(sk, script)
             args_map = dict(item.get("args", {}))
             args_map.setdefault("--spread", str(args.base_spread))
             args_map.setdefault("--slippage", str(args.base_slippage))
@@ -698,6 +720,7 @@ def main() -> int:
                 {
                     "strategy": strategy,
                     "candidate": name,
+                    "stage": stage,
                     "decision": dec,
                     "scores": {"stability": stab, "robustness": rob, "overall": ov},
                     "wf_metrics": normalize_wf(wf_json),

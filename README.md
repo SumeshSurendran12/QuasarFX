@@ -217,6 +217,21 @@ Benchmark results (20,000 timesteps, Feb 7, 2026):
 | H100 SXM | 53.23 | 375.7 |
 ## Usage
 
+## Execution Stages
+
+- Strategy 1: `PAPER_CANDIDATE`
+- Strategy 2 deterministic branches: `RESEARCH`
+- RLM/RL branches: `EXPERIMENTAL_ONLY`
+- Promotion target after paper checks: `LIVE_GATED`
+
+## Strategy 1 Deployment Artifacts
+
+- Frozen profile manifest: `strategy_1_profile.json`
+- Deployment checklist: `docs/strategy_1_deployment_checklist.md`
+- Kill-switch policy: `docs/kill_switch_policy.md`
+- Paper mode report script: `scripts/paper_trading_mode_report.py`
+- Daily health report script: `scripts/daily_health_report.py`
+
 ### Backtesting/Training
 
 ```bash

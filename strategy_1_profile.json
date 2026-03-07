@@ -1,0 +1,72 @@
+{
+  "profile_id": "strategy_1_london_compression_breakout_v1",
+  "created_utc": "2026-03-07T00:00:00+00:00",
+  "strategy_name": "Strategy 1 - London Compression Breakout",
+  "stage": "PAPER_CANDIDATE",
+  "promotion_target": "LIVE_GATED",
+  "branch_stages": {
+    "strategy_2_deterministic": "RESEARCH",
+    "rlm_rl": "EXPERIMENTAL_ONLY"
+  },
+  "frozen_parameters": {
+    "script": "scripts/vol_breakout_backtest_wf.py",
+    "horizon_bars": 6,
+    "move_threshold_pips": 40.0,
+    "prob_th": 0.62,
+    "exec_mode": "conservative",
+    "train_years": 3,
+    "test_months": 6,
+    "step_months": 6,
+    "session_filter": "london_ny",
+    "hour_windows": "7-10",
+    "regime_filter": "trend_or_range",
+    "trend_min": 0.0001,
+    "lookback": 24,
+    "buffer_pips": 1.0,
+    "sl_pips": 12.0,
+    "tp_pips": 24.0,
+    "time_stop_bars": 12,
+    "compression_max_quantile": 0.35,
+    "compression_window": 24,
+    "atr_norm_max_quantile": 0.60,
+    "atr_window": 24,
+    "require_close_confirm": true
+  },
+  "controls": {
+    "live_spread_gate_active": true,
+    "live_max_spread": 0.00022,
+    "max_trades_per_session": 1,
+    "logging_alerting_required": true,
+    "fail_safe_no_trade_conditions_required": true
+  },
+  "paper_validation_window": {
+    "min_days": 30,
+    "min_trades": 40,
+    "min_pos_fold_rate": 0.60,
+    "max_shuffle_pf_ge_model_prob": 0.20
+  },
+  "kill_switch": {
+    "spread_too_high": {
+      "enabled": true,
+      "max_spread": 0.00022,
+      "trigger_on_entry_violation_count_ge": 1
+    },
+    "too_many_skipped_bars": {
+      "enabled": true,
+      "max_consecutive_skipped_bars": 120
+    },
+    "broker_api_failure": {
+      "enabled": true,
+      "max_consecutive_failures": 3
+    },
+    "daily_drawdown_breach": {
+      "enabled": true,
+      "max_daily_drawdown_usd": 120.0
+    }
+  },
+  "reporting": {
+    "paper_mode_report_script": "scripts/paper_trading_mode_report.py",
+    "daily_health_report_script": "scripts/daily_health_report.py",
+    "kill_switch_policy_doc": "docs/kill_switch_policy.md"
+  }
+}
