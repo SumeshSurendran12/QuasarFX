@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+﻿#!/usr/bin/env python
 from __future__ import annotations
 
 import argparse
@@ -38,6 +38,15 @@ def as_float(value: Any, default: float = 0.0) -> float:
         return default
 
 
+def as_int(value: Any, default: int = 0) -> int:
+    try:
+        if value is None:
+            return default
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
 def load_json(path: Path) -> Dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
 
@@ -50,7 +59,7 @@ def latest_report(reports_dir: Path, prefix: str) -> Optional[Path]:
 
 
 def to_markdown(payload: Dict[str, Any]) -> str:
-    checks = payload.get("checks", {})
+    checks = payload.get("checks", [])
     labels = payload.get("deployment_labels", {})
     lines = [
         "# Strategy 1 Daily Health Report",
@@ -58,6 +67,7 @@ def to_markdown(payload: Dict[str, Any]) -> str:
         f"- Generated (UTC): `{payload.get('generated_utc', '')}`",
         f"- Status: `{payload.get('status', '')}`",
         f"- Profile: `{payload.get('profile_path', '')}`",
+        f"- Manifest: `{payload.get('manifest_path', '')}`",
         f"- Paper report: `{payload.get('paper_report_path', '')}`",
         "",
         "## Deployment Labels",
@@ -72,11 +82,12 @@ def to_markdown(payload: Dict[str, Any]) -> str:
     ]
     for c in checks:
         lines.append(f"- {c['name']}: `{c['pass']}` ({c['detail']})")
+
     actions = payload.get("recommended_actions", [])
     lines += ["", "## Recommended Actions", ""]
     if actions:
-        for a in actions:
-            lines.append(f"- {a}")
+        for action in actions:
+            lines.append(f"- {action}")
     else:
         lines.append("- None")
     return "\n".join(lines) + "\n"
@@ -85,7 +96,12 @@ def to_markdown(payload: Dict[str, Any]) -> str:
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Generate Strategy 1 daily health report.")
     p.add_argument("--profile", default="strategy_1_profile.json")
-    p.add_argument("--paper-report-json", default="", help="Optional paper report JSON. Defaults to latest strategy_1_paper_mode report.")
+    p.add_argument("--manifest", default="manifest.json")
+    p.add_argument(
+        "--paper-report-json",
+        default="",
+        help="Optional paper report JSON. Defaults to latest strategy_1_paper_mode report.",
+    )
     p.add_argument("--reports-dir", default="reports")
     p.add_argument("--paper-prefix", default="strategy_1_paper_mode")
     p.add_argument("--out-prefix", default="strategy_1_daily_health")
@@ -102,6 +118,13 @@ def main() -> int:
     if not profile_path.exists():
         raise FileNotFoundError(f"Profile not found: {profile_path}")
     profile = load_json(profile_path)
+
+    manifest_path = Path(args.manifest)
+    if not manifest_path.is_absolute():
+        manifest_path = ROOT / manifest_path
+    manifest: Dict[str, Any] = {}
+    if manifest_path.exists():
+        manifest = load_json(manifest_path)
 
     reports_dir = Path(args.reports_dir)
     if not reports_dir.is_absolute():
@@ -123,10 +146,10 @@ def main() -> int:
         paper = load_json(paper_path)
 
     labels = {
-        "strategy_1": str(profile.get("stage", "PAPER_CANDIDATE")),
+        "strategy_1": str(profile.get("stage", manifest.get("stage", "PAPER_CANDIDATE"))),
         "strategy_2_deterministic": str((profile.get("branch_stages", {}) or {}).get("strategy_2_deterministic", "RESEARCH")),
         "rlm_rl": str((profile.get("branch_stages", {}) or {}).get("rlm_rl", "EXPERIMENTAL_ONLY")),
-        "promotion_target": str(profile.get("promotion_target", "LIVE_GATED")),
+        "promotion_target": str(profile.get("promotion_target", manifest.get("promotion_target", "LIVE_GATED"))),
     }
 
     expected_labels_ok = (
@@ -135,9 +158,11 @@ def main() -> int:
         and labels["rlm_rl"] == "EXPERIMENTAL_ONLY"
         and labels["promotion_target"] == "LIVE_GATED"
     )
-    spread_gate_active = bool((profile.get("controls", {}) or {}).get("live_spread_gate_active", False))
-    one_trade_cap = int(as_float((profile.get("controls", {}) or {}).get("max_trades_per_session"), 0.0)) == 1
-    frozen_profile = bool(profile.get("frozen_parameters"))
+
+    controls = profile.get("controls", {}) if isinstance(profile.get("controls"), dict) else {}
+    spread_gate_active = bool(controls.get("live_spread_gate_active", False))
+    one_trade_cap = as_int(controls.get("max_trades_per_session"), 0) == 1
+    frozen_profile = bool(manifest.get("frozen_parameters") or profile.get("frozen_parameters"))
 
     has_paper = bool(paper)
     paper_generated = parse_ts(str(paper.get("generated_utc", ""))) if has_paper else None
@@ -149,12 +174,13 @@ def main() -> int:
     summary = paper.get("summary", {}) if isinstance(paper.get("summary"), dict) else {}
     paper_checks = paper.get("checks", {}) if isinstance(paper.get("checks"), dict) else {}
     kill_switch = paper.get("kill_switch", {}) if isinstance(paper.get("kill_switch"), dict) else {}
-    max_consec_skip = int(as_float(summary.get("max_consecutive_skipped_bars"), 0.0))
-    max_consec_fail = int(as_float(summary.get("max_consecutive_api_failures"), 0.0))
+
+    max_consec_skip = as_int(summary.get("max_consecutive_skipped_bars"), 0)
+    max_consec_fail = as_int(summary.get("max_consecutive_api_failures"), 0)
 
     ks_cfg = profile.get("kill_switch", {}) if isinstance(profile.get("kill_switch"), dict) else {}
-    skip_limit = int(as_float((ks_cfg.get("too_many_skipped_bars", {}) or {}).get("max_consecutive_skipped_bars"), 0.0))
-    fail_limit = int(as_float((ks_cfg.get("broker_api_failure", {}) or {}).get("max_consecutive_failures"), 0.0))
+    skip_limit = as_int((ks_cfg.get("too_many_skipped_bars", {}) or {}).get("max_consecutive_skipped_bars"), 0)
+    fail_limit = as_int((ks_cfg.get("broker_api_failure", {}) or {}).get("max_consecutive_failures"), 0)
 
     kill_switch_clear = not bool(kill_switch.get("is_halted", False))
     paper_window_pass = bool(paper_checks.get("paper_window_pass", False))
@@ -162,15 +188,60 @@ def main() -> int:
     broker_health = bool(fail_limit <= 0 or max_consec_fail < fail_limit)
     drawdown_health = "daily_drawdown_breach" not in list(kill_switch.get("triggered", []))
 
+    event_contract_common_fields_pass = bool(paper_checks.get("event_contract_common_fields_pass", False))
+    event_contract_event_fields_pass = bool(paper_checks.get("event_contract_event_fields_pass", False))
+    schema_event_values_valid = bool(paper_checks.get("schema_event_values_valid", False))
+    schema_reason_values_valid = bool(paper_checks.get("schema_reason_values_valid", False))
+    profile_hash_consistent = bool(paper_checks.get("profile_hash_consistent", False))
+    profile_hash_matches_expected = bool(paper_checks.get("profile_hash_matches_expected", False))
+    stage_consistent = bool(paper_checks.get("stage_consistent", False))
+    strategy_id_consistent = bool(paper_checks.get("strategy_id_consistent", False))
+
     checks: List[Dict[str, Any]] = [
         {"name": "deployment_labels_explicit", "pass": expected_labels_ok, "detail": f"{labels}"},
         {"name": "spread_gate_active", "pass": spread_gate_active, "detail": "profile.controls.live_spread_gate_active"},
         {"name": "one_trade_per_session_cap", "pass": one_trade_cap, "detail": "profile.controls.max_trades_per_session == 1"},
-        {"name": "frozen_parameters_recorded", "pass": frozen_profile, "detail": "strategy_1_profile.json contains frozen_parameters"},
+        {"name": "frozen_parameters_recorded", "pass": frozen_profile, "detail": "manifest/profile contains frozen_parameters"},
         {"name": "paper_report_available", "pass": has_paper, "detail": str(paper_path) if paper_path else "not found"},
         {"name": "paper_report_fresh", "pass": paper_fresh, "detail": f"age_hours={age_hours if age_hours is not None else 'n/a'}"},
         {"name": "paper_window_pass", "pass": paper_window_pass, "detail": "paper report checks.paper_window_pass"},
         {"name": "kill_switch_clear", "pass": kill_switch_clear, "detail": f"triggered={kill_switch.get('triggered', [])}"},
+        {
+            "name": "event_contract_common_fields_pass",
+            "pass": event_contract_common_fields_pass,
+            "detail": f"missing_common_field_events={as_int(summary.get('missing_common_field_events'), 0)}",
+        },
+        {
+            "name": "event_contract_event_fields_pass",
+            "pass": event_contract_event_fields_pass,
+            "detail": f"missing_event_field_events={as_int(summary.get('missing_event_field_events'), 0)}",
+        },
+        {
+            "name": "schema_event_values_valid",
+            "pass": schema_event_values_valid,
+            "detail": f"unknown_event_value_events={as_int(summary.get('unknown_event_value_events'), 0)}",
+        },
+        {
+            "name": "schema_reason_values_valid",
+            "pass": schema_reason_values_valid,
+            "detail": f"unknown_reason_code_events={as_int(summary.get('unknown_reason_code_events'), 0)}",
+        },
+        {
+            "name": "profile_hash_consistent",
+            "pass": profile_hash_consistent,
+            "detail": f"profile_hash_values_seen={summary.get('profile_hash_values_seen', {})}",
+        },
+        {
+            "name": "profile_hash_matches_expected",
+            "pass": profile_hash_matches_expected,
+            "detail": f"profile_hash_mismatch_events={as_int(summary.get('profile_hash_mismatch_events'), 0)}",
+        },
+        {"name": "stage_consistent", "pass": stage_consistent, "detail": f"stage_values_seen={summary.get('stage_values_seen', {})}"},
+        {
+            "name": "strategy_id_consistent",
+            "pass": strategy_id_consistent,
+            "detail": f"strategy_values_seen={summary.get('strategy_values_seen', {})}",
+        },
         {"name": "skip_bar_health", "pass": skip_health, "detail": f"{max_consec_skip}/{skip_limit}"},
         {"name": "broker_api_health", "pass": broker_health, "detail": f"{max_consec_fail}/{fail_limit}"},
         {"name": "daily_drawdown_health", "pass": drawdown_health, "detail": "daily_drawdown_breach not triggered"},
@@ -186,25 +257,35 @@ def main() -> int:
         elif name == "paper_report_fresh":
             recommended_actions.append("Refresh paper report (report is stale).")
         elif name == "paper_window_pass":
-            recommended_actions.append("Continue paper trading until window and trade-count requirements pass.")
+            recommended_actions.append("Continue paper trading until minimum days and trades are met.")
         elif name == "kill_switch_clear":
             recommended_actions.append("Keep trading halted until kill-switch trigger is cleared and reviewed.")
+        elif name in {
+            "event_contract_common_fields_pass",
+            "event_contract_event_fields_pass",
+            "schema_event_values_valid",
+            "schema_reason_values_valid",
+            "profile_hash_consistent",
+            "profile_hash_matches_expected",
+            "stage_consistent",
+            "strategy_id_consistent",
+        }:
+            recommended_actions.append("Fix event logging contract violations before promotion decisions.")
         elif name == "skip_bar_health":
-            recommended_actions.append("Investigate data/feed conditions causing excessive skipped bars.")
+            recommended_actions.append("Investigate feed/latency conditions causing excessive skipped bars.")
         elif name == "broker_api_health":
-            recommended_actions.append("Investigate broker/API stability; hold trading until failures stabilize.")
+            recommended_actions.append("Investigate broker/API stability and hold trading until failures stabilize.")
         elif name == "daily_drawdown_health":
             recommended_actions.append("Daily drawdown breach detected; pause until next session and review risk.")
         else:
             recommended_actions.append(f"Fix failing check: {name}.")
 
+    all_checks_pass = all(bool(c["pass"]) for c in checks)
     if not has_paper:
         status = "NO_DATA"
     elif not kill_switch_clear:
         status = "HALT"
-    elif not paper_window_pass:
-        status = "ATTENTION"
-    elif all(bool(c["pass"]) for c in checks):
+    elif all_checks_pass and paper_window_pass:
         status = "HEALTHY"
     else:
         status = "ATTENTION"
@@ -213,10 +294,19 @@ def main() -> int:
         "generated_utc": utc_now().isoformat(),
         "status": status,
         "profile_path": str(profile_path.resolve()),
+        "manifest_path": str(manifest_path.resolve()) if manifest_path.exists() else "",
         "paper_report_path": str(paper_path.resolve()) if paper_path else "",
         "deployment_labels": labels,
         "checks": checks,
-        "recommended_actions": recommended_actions,
+        "recommended_actions": sorted(set(recommended_actions)),
+        "paper_snapshot": {
+            "paper_status": str(paper.get("status", "")),
+            "paper_days": as_int(paper.get("paper_days"), 0),
+            "trade_count": as_int(summary.get("trade_count"), 0),
+            "net_pnl_usd": as_float(summary.get("net_pnl_usd"), 0.0),
+            "profit_factor": as_float(summary.get("profit_factor"), 0.0),
+            "last_trade_age_minutes": summary.get("last_trade_age_minutes"),
+        },
     }
 
     ts = utc_now().strftime("%Y%m%d_%H%M%S")

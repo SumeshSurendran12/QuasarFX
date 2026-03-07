@@ -226,9 +226,13 @@ Benchmark results (20,000 timesteps, Feb 7, 2026):
 
 ## Strategy 1 Deployment Artifacts
 
-- Frozen profile manifest: `strategy_1_profile.json`
+- Frozen profile: `strategy_1_profile.json`
+- Frozen deployment manifest: `manifest.json`
+- Canonical event schema: `schemas/strategy_1_events.schema.json`
+- Canonical runtime logs: `events.jsonl` + `daily_summary.json`
 - Deployment checklist: `docs/strategy_1_deployment_checklist.md`
 - Kill-switch policy: `docs/kill_switch_policy.md`
+- Daily summary builder script: `scripts/build_daily_summary.py`
 - Paper mode report script: `scripts/paper_trading_mode_report.py`
 - Daily health report script: `scripts/daily_health_report.py`
 

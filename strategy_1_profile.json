@@ -2,6 +2,7 @@
   "profile_id": "strategy_1_london_compression_breakout_v1",
   "created_utc": "2026-03-07T00:00:00+00:00",
   "strategy_name": "Strategy 1 - London Compression Breakout",
+  "manifest_path": "manifest.json",
   "stage": "PAPER_CANDIDATE",
   "promotion_target": "LIVE_GATED",
   "branch_stages": {
@@ -34,6 +35,7 @@
   },
   "controls": {
     "live_spread_gate_active": true,
+    "live_max_spread_pips": 2.2,
     "live_max_spread": 0.00022,
     "max_trades_per_session": 1,
     "logging_alerting_required": true,
@@ -65,8 +67,23 @@
     }
   },
   "reporting": {
+    "event_schema_path": "schemas/strategy_1_events.schema.json",
+    "events_file": "events.jsonl",
+    "daily_summary_file": "daily_summary.json",
     "paper_mode_report_script": "scripts/paper_trading_mode_report.py",
+    "daily_summary_script": "scripts/build_daily_summary.py",
     "daily_health_report_script": "scripts/daily_health_report.py",
     "kill_switch_policy_doc": "docs/kill_switch_policy.md"
+  },
+  "event_contract": {
+    "schema_path": "schemas/strategy_1_events.schema.json",
+    "required_common_fields": [
+      "ts",
+      "run_id",
+      "event",
+      "stage",
+      "strategy_id",
+      "profile_hash"
+    ]
   }
 }

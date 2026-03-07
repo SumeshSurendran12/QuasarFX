@@ -8,10 +8,14 @@
 
 ## Frozen Profile
 - `strategy_1_profile.json` exists and is versioned
+- `manifest.json` exists and is versioned
 - Frozen parameters are unchanged during the paper-validation window
 - Live controls are explicit:
   - spread gate active
   - one trade/session cap
+- Event contract is frozen:
+  - schema: `schemas/strategy_1_events.schema.json`
+  - required common fields: `ts`, `run_id`, `event`, `stage`, `strategy_id`, `profile_hash`
 
 ## Paper Validation Window
 - Run paper mode for at least 30 calendar days
@@ -20,9 +24,11 @@
 - Daily health report generated and reviewed
 
 ## Logging and Alerting
-- Action/decision logs enabled
+- Canonical execution log enabled (`events.jsonl`)
+- End-of-day aggregate generated (`daily_summary.json`)
 - Spread-gate skips logged
 - API failures logged
+- Profile hash logged on every event
 - Daily health report generated (`scripts/daily_health_report.py`)
 
 ## Fail-Safe No-Trade Conditions
