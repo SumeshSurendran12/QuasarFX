@@ -418,19 +418,7 @@ DEFAULT_CANDIDATES: Dict[str, List[Dict[str, Any]]] = {
                 "--spread": "0.0002", "--slippage": "0.00005", "--commission": "0.0001",
             },
         },
-    ],
-    "strategy_2": [
-        {
-            "name": "S2_NY_Pullback_Trend_Continuation",
-            "script": "scripts/ny_pullback_trend_continuation_wf.py",
-            "args": {
-                "--train-years": "3", "--test-months": "6", "--step-months": "6",
-                "--session-filter": "ny_only", "--hour-windows": "12-17", "--max-trades-per-session": "1",
-                "--sl-atr": "1.0", "--tp-atr": "1.6", "--time-stop-bars": "10",
-                "--spread": "0.0002", "--slippage": "0.00005", "--commission": "0.0001",
-            },
-        }
-    ],
+    ]
 }
 
 
