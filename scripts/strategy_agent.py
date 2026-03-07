@@ -355,7 +355,7 @@ def suggest_patch(
         min_folds_meeting_trades=min_folds_meeting_trades,
     )
     if sample["is_sufficient"] < 0.5:
-        return "Insufficient WF sample: increase trade count or calibrate gate to train take-rate band (0.15-0.60)."
+        return "Insufficient WF sample: increase deterministic trade count via session/rule adjustments; skip RL gate retuning."
     lb_valid = lockbox_pf_validity(lockbox_base_report, min_lockbox_trades=min_lockbox_trades)
     if lb_valid["is_sufficient"] < 0.5:
         return "LOCKBOX_TOO_FEW_TRADES: do not infer robustness PF until lockbox trades >= 30."
