@@ -1,5 +1,7 @@
 {
   "profile_id": "strategy_1_london_compression_breakout_v1",
+  "manifest_version": "1.0.0",
+  "schema_version": "1.0.0",
   "created_utc": "2026-03-07T00:00:00+00:00",
   "strategy_name": "Strategy 1 - London Compression Breakout",
   "manifest_path": "manifest.json",
@@ -69,7 +71,11 @@
   "reporting": {
     "event_schema_path": "schemas/strategy_1_events.schema.json",
     "events_file": "events.jsonl",
+    "canonical_window_start_utc": "2026-03-08T04:32:49Z",
     "daily_summary_file": "daily_summary.json",
+    "daily_pipeline_script": "scripts/run_daily_paper_pipeline.ps1",
+    "daily_pipeline_time_local": "18:05",
+    "daily_pipeline_timezone": "America/Chicago",
     "paper_mode_report_script": "scripts/paper_trading_mode_report.py",
     "daily_summary_script": "scripts/build_daily_summary.py",
     "daily_health_report_script": "scripts/daily_health_report.py",
@@ -77,13 +83,31 @@
   },
   "event_contract": {
     "schema_path": "schemas/strategy_1_events.schema.json",
+    "run_id_pattern": "^\\d{4}-\\d{2}-\\d{2}_[A-Z0-9]+_sha[a-f0-9]{8}$",
+    "reason_codes": [
+      "signal_pass",
+      "spread_gate",
+      "session_cap",
+      "daily_loss_limit",
+      "max_open_positions",
+      "outside_session",
+      "cooldown_active",
+      "duplicate_signal",
+      "no_liquidity",
+      "manual_disable",
+      "policy_breach",
+      "within_limits",
+      "broker_api_failure"
+    ],
     "required_common_fields": [
       "ts",
       "run_id",
       "event",
       "stage",
       "strategy_id",
-      "profile_hash"
+      "profile_hash",
+      "schema_version",
+      "manifest_version"
     ]
   }
 }

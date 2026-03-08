@@ -13,21 +13,35 @@ Configuration module for the Forex Trading Bot
 import os
 from pathlib import Path
 from datetime import datetime, timedelta
-from dukascopy_python.instruments import (
-    INSTRUMENT_FX_MAJORS_EUR_USD,
-    INSTRUMENT_FX_MAJORS_GBP_USD,
-    INSTRUMENT_FX_MAJORS_USD_JPY,
-    INSTRUMENT_FX_MAJORS_AUD_USD,
-    INSTRUMENT_FX_MAJORS_USD_CHF,
-    INSTRUMENT_FX_MAJORS_USD_CAD,
-    INSTRUMENT_FX_MAJORS_NZD_USD
-)
-from dukascopy_python import (
-    INTERVAL_TICK,
-    INTERVAL_HOUR_1,
-    INTERVAL_HOUR_4,
-    OFFER_SIDE_BID,
-)
+try:
+    from dukascopy_python.instruments import (
+        INSTRUMENT_FX_MAJORS_EUR_USD,
+        INSTRUMENT_FX_MAJORS_GBP_USD,
+        INSTRUMENT_FX_MAJORS_USD_JPY,
+        INSTRUMENT_FX_MAJORS_AUD_USD,
+        INSTRUMENT_FX_MAJORS_USD_CHF,
+        INSTRUMENT_FX_MAJORS_USD_CAD,
+        INSTRUMENT_FX_MAJORS_NZD_USD
+    )
+    from dukascopy_python import (
+        INTERVAL_TICK,
+        INTERVAL_HOUR_1,
+        INTERVAL_HOUR_4,
+        OFFER_SIDE_BID,
+    )
+except ModuleNotFoundError:
+    # Allow live/paper MT5 execution paths to run even when Dukascopy SDK is unavailable.
+    INSTRUMENT_FX_MAJORS_EUR_USD = "EUR/USD"
+    INSTRUMENT_FX_MAJORS_GBP_USD = "GBP/USD"
+    INSTRUMENT_FX_MAJORS_USD_JPY = "USD/JPY"
+    INSTRUMENT_FX_MAJORS_AUD_USD = "AUD/USD"
+    INSTRUMENT_FX_MAJORS_USD_CHF = "USD/CHF"
+    INSTRUMENT_FX_MAJORS_USD_CAD = "USD/CAD"
+    INSTRUMENT_FX_MAJORS_NZD_USD = "NZD/USD"
+    INTERVAL_TICK = "TICK"
+    INTERVAL_HOUR_1 = "H1"
+    INTERVAL_HOUR_4 = "H4"
+    OFFER_SIDE_BID = "BID"
 
 # === 1. Data Download/Source (Dukascopy) ===
 SYMBOL_MAP = {
@@ -131,6 +145,7 @@ LOW_EXPECTANCY_CLOSE_PENALTY_SCALE = float(os.getenv("FX_LOW_EXPECTANCY_CLOSE_PE
 # === Strategy Profiles (frozen deployment configs) ===
 STRATEGY_1_NAME = os.getenv("FX_STRATEGY_1_NAME", "London Compression Breakout (Low Spread Only)")
 STRATEGY_1_LIVE_MAX_SPREAD = float(os.getenv("FX_STRATEGY_1_LIVE_MAX_SPREAD", "0.00022"))  # Skip entries when live spread exceeds this threshold
+DATA_FEED_HEARTBEAT_SECONDS = int(os.getenv("FX_DATA_FEED_HEARTBEAT_SECONDS", "60"))  # Emit data feed heartbeat event every N seconds
 
 # === 6. Training/Backtesting Parameters ===
 MAX_EPISODES = 2200000  # Maximum number of training episodes

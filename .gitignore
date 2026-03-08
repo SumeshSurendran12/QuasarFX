@@ -7,6 +7,8 @@ wandb/
 data/
 logs/
 reports/ 
+events.jsonl
+daily_summary.json
 # C extensions
 *.so
 

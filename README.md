@@ -230,11 +230,45 @@ Benchmark results (20,000 timesteps, Feb 7, 2026):
 - Frozen deployment manifest: `manifest.json`
 - Canonical event schema: `schemas/strategy_1_events.schema.json`
 - Canonical runtime logs: `events.jsonl` + `daily_summary.json`
+- Canonical run_id format: `YYYY-MM-DD_SESSION_shaXXXXXXXX` (example: `2026-03-07_LONDON_sha9f2c1ab4`)
+- Frozen reason_code vocabulary: `signal_pass`, `spread_gate`, `session_cap`, `daily_loss_limit`, `max_open_positions`, `outside_session`, `cooldown_active`, `duplicate_signal`, `no_liquidity`, `manual_disable`, `policy_breach`, `within_limits`, `broker_api_failure`
+- Contract versions on every event: `schema_version=1.0.0`, `manifest_version=1.0.0`
 - Deployment checklist: `docs/strategy_1_deployment_checklist.md`
 - Kill-switch policy: `docs/kill_switch_policy.md`
 - Daily summary builder script: `scripts/build_daily_summary.py`
 - Paper mode report script: `scripts/paper_trading_mode_report.py`
 - Daily health report script: `scripts/daily_health_report.py`
+- Run ID generator: `scripts/generate_strategy_1_run_id.py`
+- Daily pipeline runner: `scripts/run_daily_paper_pipeline.ps1`
+- Task scheduler registration script: `scripts/register_daily_paper_pipeline_task.ps1`
+
+### Daily Paper Pipeline
+
+Run immediately:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\run_daily_paper_pipeline.ps1
+```
+
+Daily artifacts are written under `reports/YYYY-MM-DD/`:
+- `reports/YYYY-MM-DD/daily_summary.json`
+- `reports/YYYY-MM-DD/paper_report.json`
+- `reports/YYYY-MM-DD/daily_health.json`
+- `reports/YYYY-MM-DD/daily_pipeline.log`
+
+Generate a canonical run_id for the session:
+
+```powershell
+python .\scripts\generate_strategy_1_run_id.py --session LONDON
+```
+
+Schedule daily at 18:05 local time:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\register_daily_paper_pipeline_task.ps1 -TaskName FX_Strategy1_DailyPipeline -StartTime 18:05
+```
+
+If task registration fails with permissions, run the command in an elevated PowerShell session.
 
 ### Backtesting/Training
 
@@ -252,7 +286,16 @@ python live_trading.py
 
 > **Note:**  
 > - `main.py` is for backtesting/training only.  
-> - `live_trading.py` is for live trading only.
+> - `live_trading.py` supports canonical paper-event emission via `FX_EXECUTION_MODE=paper` (default).
+> - Set `FX_EXECUTION_MODE=live` only when you explicitly want live order routing.
+
+Paper session quick-start (Windows PowerShell):
+```powershell
+$env:FX_EXECUTION_MODE = "paper"
+$env:FX_MAX_DURATION_SECONDS = "600"
+cd modules
+python live_trading.py
+```
 
 ### Model Saving and Live Trading
 

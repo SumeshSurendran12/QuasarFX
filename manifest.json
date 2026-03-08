@@ -1,5 +1,7 @@
 {
   "manifest_id": "strategy_1_manifest_v1",
+  "manifest_version": "1.0.0",
+  "schema_version": "1.0.0",
   "created_utc": "2026-03-07T00:00:00+00:00",
   "strategy_id": "strategy_1",
   "stage": "PAPER_CANDIDATE",
@@ -58,6 +60,22 @@
     }
   },
   "event_contract": {
+    "run_id_pattern": "^\\d{4}-\\d{2}-\\d{2}_[A-Z0-9]+_sha[a-f0-9]{8}$",
+    "reason_codes": [
+      "signal_pass",
+      "spread_gate",
+      "session_cap",
+      "daily_loss_limit",
+      "max_open_positions",
+      "outside_session",
+      "cooldown_active",
+      "duplicate_signal",
+      "no_liquidity",
+      "manual_disable",
+      "policy_breach",
+      "within_limits",
+      "broker_api_failure"
+    ],
     "schema_path": "schemas/strategy_1_events.schema.json",
     "events_file": "events.jsonl",
     "daily_summary_file": "daily_summary.json",
@@ -67,7 +85,9 @@
       "event",
       "stage",
       "strategy_id",
-      "profile_hash"
+      "profile_hash",
+      "schema_version",
+      "manifest_version"
     ]
   }
 }

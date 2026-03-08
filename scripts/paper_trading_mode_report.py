@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import re
 from collections import Counter, defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -11,7 +12,10 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 ROOT = Path(__file__).resolve().parents[1]
 
-DEFAULT_COMMON_FIELDS = ["ts", "run_id", "event", "stage", "strategy_id", "profile_hash"]
+DEFAULT_COMMON_FIELDS = ["ts", "run_id", "event", "stage", "strategy_id", "profile_hash", "schema_version", "manifest_version"]
+DEFAULT_SCHEMA_VERSION = "1.0.0"
+DEFAULT_MANIFEST_VERSION = "1.0.0"
+RUN_ID_REGEX = re.compile(r"^(?P<date>\d{4}-\d{2}-\d{2})_(?P<session>[A-Z0-9]+)_sha(?P<hash>[a-f0-9]{8})$")
 DEFAULT_EVENTS = {
     "session_start",
     "signal_evaluated",
@@ -24,6 +28,8 @@ DEFAULT_EVENTS = {
     "kill_switch_check",
     "kill_switch_triggered",
     "session_end",
+    "market_closed",
+    "data_feed_alive",
 }
 DEFAULT_REASON_CODES = {
     "signal_pass",
@@ -64,6 +70,8 @@ DEFAULT_EVENT_REQUIRED_FIELDS: Dict[str, List[str]] = {
     "kill_switch_check": ["status", "reason_code"],
     "kill_switch_triggered": ["status", "reason_code"],
     "session_end": ["symbol", "trades", "net_pnl_usd", "status"],
+    "market_closed": ["symbol"],
+    "data_feed_alive": ["symbol"],
 }
 
 
@@ -171,6 +179,12 @@ def daily_pnl_series(rows: List[Tuple[Optional[datetime], float]]) -> Dict[str, 
     return out
 
 
+def day_key(ts: Optional[datetime]) -> str:
+    if ts is None:
+        return "unknown"
+    return ts.date().isoformat()
+
+
 def session_key(ev: Dict[str, Any], ts: Optional[datetime]) -> str:
     run_id = str(ev.get("run_id", "")).strip()
     if run_id:
@@ -233,6 +247,20 @@ def get_required_common_fields(manifest: Dict[str, Any], profile: Dict[str, Any]
         return [str(x) for x in from_profile]
 
     return list(DEFAULT_COMMON_FIELDS)
+
+
+def get_expected_version_fields(manifest: Dict[str, Any], profile: Dict[str, Any]) -> Tuple[str, str]:
+    schema_version = str(
+        manifest.get("schema_version")
+        or profile.get("schema_version")
+        or DEFAULT_SCHEMA_VERSION
+    ).strip() or DEFAULT_SCHEMA_VERSION
+    manifest_version = str(
+        manifest.get("manifest_version")
+        or profile.get("manifest_version")
+        or DEFAULT_MANIFEST_VERSION
+    ).strip() or DEFAULT_MANIFEST_VERSION
+    return schema_version, manifest_version
 
 
 def extract_schema_contract(schema: Dict[str, Any]) -> Tuple[Set[str], Set[str], Dict[str, List[str]]]:
@@ -341,6 +369,7 @@ def to_markdown(payload: Dict[str, Any]) -> str:
         "",
         "## Window",
         "",
+        f"- Canonical window start (UTC): `{payload.get('canonical_window_start_utc', '')}`",
         f"- Start (UTC): `{payload.get('window_start_utc', '')}`",
         f"- End (UTC): `{payload.get('window_end_utc', '')}`",
         f"- Days covered: `{payload.get('paper_days', 0)}`",
@@ -349,6 +378,8 @@ def to_markdown(payload: Dict[str, Any]) -> str:
         "",
         f"- status: `{payload.get('status', '')}`",
         f"- events: `{as_int(s.get('total_events'))}` | trades: `{as_int(s.get('trade_count'))}`",
+        f"- source_events_total_unfiltered: `{as_int(s.get('source_events_total_unfiltered'))}` | source_events_excluded_before_window: `{as_int(s.get('source_events_excluded_before_window'))}`",
+        f"- ingestion_state: `{s.get('ingestion_state', '')}` | first_event_ts_utc: `{s.get('first_event_ts_utc', '')}` | last_event_ts_utc: `{s.get('last_event_ts_utc', '')}`",
         f"- net_pnl_usd: `{as_float(s.get('net_pnl_usd')):.2f}` | win_rate: `{as_float(s.get('win_rate')):.2f}` | pf: `{as_float(s.get('profit_factor')):.2f}`",
         f"- max_dd_usd: `{as_float(s.get('max_drawdown_usd')):.2f}` | avg_slippage_pips: `{as_float(s.get('avg_slippage_pips')):.3f}` | avg_fill_spread_pips: `{as_float(s.get('avg_fill_spread_pips')):.3f}`",
         f"- spread_gate_skips: `{as_int(s.get('spread_gate_skips'))}` | session_cap_skips: `{as_int(s.get('session_cap_skips'))}`",
@@ -363,6 +394,12 @@ def to_markdown(payload: Dict[str, Any]) -> str:
         f"- unknown_event_value_events: `{as_int(s.get('unknown_event_value_events'))}`",
         f"- unknown_reason_code_events: `{as_int(s.get('unknown_reason_code_events'))}`",
         f"- profile_hash_missing_events: `{as_int(s.get('profile_hash_missing_events'))}` | profile_hash_mismatch_events: `{as_int(s.get('profile_hash_mismatch_events'))}`",
+        f"- schema_version_mismatch_events: `{as_int(s.get('schema_version_mismatch_events'))}` | manifest_version_mismatch_events: `{as_int(s.get('manifest_version_mismatch_events'))}`",
+        f"- invalid_run_id_events: `{as_int(s.get('invalid_run_id_events'))}` | run_id_hash_prefix_mismatch_events: `{as_int(s.get('run_id_hash_prefix_mismatch_events'))}`",
+        f"- monotonic_order_violations: `{as_int(s.get('monotonic_order_violations'))}`",
+        f"- lifecycle_fill_without_submit: `{as_int(s.get('lifecycle_fill_without_submit_count'))}` | lifecycle_close_without_fill: `{as_int(s.get('lifecycle_close_without_fill_count'))}`",
+        f"- lifecycle_duplicate_close: `{as_int(s.get('lifecycle_duplicate_close_count'))}` | lifecycle_mixed_side: `{as_int(s.get('lifecycle_mixed_side_count'))}`",
+        f"- contract_violation_days: `{len((s.get('contract_violation_counters_by_day') or {}))}`",
         "",
         "## Checks",
         "",
@@ -388,6 +425,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--events-jsonl", default="", help="Optional JSONL/JSON events file.")
     p.add_argument("--window-start", default="", help="Optional ISO-8601 UTC window start.")
     p.add_argument("--window-end", default="", help="Optional ISO-8601 UTC window end.")
+    p.add_argument("--allow-non-monotonic", action="store_true", help="Allow non-monotonic event timestamps within a run.")
     p.add_argument("--reports-dir", default="reports")
     p.add_argument("--out-prefix", default="strategy_1_paper_mode")
     return p.parse_args()
@@ -429,6 +467,16 @@ def main() -> int:
         schema = load_json(schema_path)
 
     required_common_fields = get_required_common_fields(manifest=manifest, profile=profile)
+    expected_schema_version, expected_manifest_version = get_expected_version_fields(manifest=manifest, profile=profile)
+    run_id_pattern_text = str((manifest.get("event_contract", {}) or {}).get("run_id_pattern", "")).strip()
+    if not run_id_pattern_text:
+        run_id_pattern_text = str((profile.get("event_contract", {}) or {}).get("run_id_pattern", "")).strip()
+    run_id_regex = RUN_ID_REGEX
+    if run_id_pattern_text:
+        try:
+            run_id_regex = re.compile(run_id_pattern_text)
+        except re.error:
+            run_id_regex = RUN_ID_REGEX
     schema_events, schema_reasons, event_required_fields = extract_schema_contract(schema=schema)
 
     expected_hashes: Set[str] = set()
@@ -447,7 +495,54 @@ def main() -> int:
         if not events_path.is_absolute():
             events_path = ROOT / events_path
 
-    events = load_events(events_path)
+    source_events = load_events(events_path)
+    source_events_total_unfiltered = int(len(source_events))
+
+    configured_window_start = str(args.window_start).strip()
+    if not configured_window_start:
+        configured_window_start = str((profile.get("reporting", {}) or {}).get("canonical_window_start_utc", "")).strip()
+    if not configured_window_start:
+        configured_window_start = str((manifest.get("event_contract", {}) or {}).get("canonical_window_start_utc", "")).strip()
+    canonical_window_start = parse_ts(configured_window_start) if configured_window_start else None
+    if configured_window_start and canonical_window_start is None:
+        raise ValueError(f"Invalid --window-start / canonical_window_start_utc: {configured_window_start}")
+
+    if canonical_window_start is None:
+        events = source_events
+    else:
+        events = []
+        for ev in source_events:
+            ts = event_ts(ev)
+            if ts is not None and ts >= canonical_window_start:
+                events.append(ev)
+    source_events_excluded_before_window = int(source_events_total_unfiltered - len(events))
+
+    violation_counts_by_day: Dict[str, Counter[str]] = defaultdict(Counter)
+    monotonic_order_violations = 0
+    monotonic_order_examples: List[Dict[str, Any]] = []
+    if events:
+        last_ts_by_run: Dict[str, datetime] = {}
+        for idx, ev in enumerate(events):
+            run_id = str(ev.get("run_id", "")).strip() or "__missing_run_id__"
+            ts = event_ts(ev)
+            if ts is None:
+                continue
+            prev = last_ts_by_run.get(run_id)
+            if prev is not None and ts < prev:
+                monotonic_order_violations += 1
+                violation_counts_by_day[day_key(ts)]["monotonic_order_violation"] += 1
+                if len(monotonic_order_examples) < 5:
+                    monotonic_order_examples.append(
+                        {
+                            "index": idx,
+                            "run_id": run_id,
+                            "prev_ts": prev.isoformat(),
+                            "ts": ts.isoformat(),
+                        }
+                    )
+            else:
+                last_ts_by_run[run_id] = ts
+
     enriched: List[Tuple[Optional[datetime], Dict[str, Any]]] = [(event_ts(ev), ev) for ev in events]
     enriched.sort(key=lambda x: x[0] or datetime.min.replace(tzinfo=timezone.utc))
 
@@ -460,6 +555,7 @@ def main() -> int:
     profile_hash_values: Counter[str] = Counter()
     stage_values: Counter[str] = Counter()
     strategy_values: Counter[str] = Counter()
+    run_id_values: Counter[str] = Counter()
 
     missing_common_field_events = 0
     missing_event_field_events = 0
@@ -467,11 +563,23 @@ def main() -> int:
     unknown_reason_code_events = 0
     profile_hash_missing_events = 0
     profile_hash_mismatch_events = 0
+    schema_version_mismatch_events = 0
+    manifest_version_mismatch_events = 0
+    invalid_run_id_events = 0
+    run_id_hash_prefix_mismatch_events = 0
 
     pnl_rows: List[Tuple[Optional[datetime], float]] = []
     session_trade_ids: Dict[str, Set[str]] = defaultdict(set)
     slippage_pips: List[float] = []
     fill_spread_pips: List[float] = []
+    submit_ids: Set[Tuple[str, str]] = set()
+    fill_ids: Set[Tuple[str, str]] = set()
+    close_ids: Set[Tuple[str, str]] = set()
+    close_counts: Dict[Tuple[str, str], int] = defaultdict(int)
+    trade_sides: Dict[Tuple[str, str], Set[str]] = defaultdict(set)
+    trade_first_day: Dict[Tuple[str, str], str] = {}
+    fill_trade_day: Dict[Tuple[str, str], str] = {}
+    close_trade_day: Dict[Tuple[str, str], str] = {}
 
     spread_gate_violations = 0
     spread_gate_skips = 0
@@ -492,32 +600,40 @@ def main() -> int:
     for idx, (ts, ev) in enumerate(enriched):
         event_name = str(ev.get("event", "")).strip()
         reason_code = str(ev.get("reason_code", "")).strip()
+        event_day = day_key(ts)
 
         if event_name:
             event_counts[event_name] += 1
             if schema_events and event_name not in schema_events:
                 unknown_event_value_events += 1
+                violation_counts_by_day[event_day]["unknown_event_value"] += 1
         else:
             unknown_event_value_events += 1
+            violation_counts_by_day[event_day]["unknown_event_value"] += 1
 
         if reason_code:
             if schema_reasons and reason_code not in schema_reasons:
                 unknown_reason_code_events += 1
+                violation_counts_by_day[event_day]["unknown_reason_code"] += 1
 
         if event_missing_fields(ev, required_common_fields):
             missing_common_field_events += 1
+            violation_counts_by_day[event_day]["missing_common_fields"] += 1
 
         required_for_event = event_required_fields.get(event_name, [])
         if required_for_event and event_missing_fields(ev, required_for_event):
             missing_event_field_events += 1
+            violation_counts_by_day[event_day]["missing_event_fields"] += 1
 
         normalized_hash = normalize_profile_hash(ev.get("profile_hash"))
         if normalized_hash:
             profile_hash_values[normalized_hash] += 1
             if expected_hashes and normalized_hash not in expected_hashes:
                 profile_hash_mismatch_events += 1
+                violation_counts_by_day[event_day]["profile_hash_mismatch"] += 1
         else:
             profile_hash_missing_events += 1
+            violation_counts_by_day[event_day]["profile_hash_missing"] += 1
 
         stage = str(ev.get("stage", "")).strip()
         if stage:
@@ -526,6 +642,31 @@ def main() -> int:
         strategy_id = str(ev.get("strategy_id", "")).strip()
         if strategy_id:
             strategy_values[strategy_id] += 1
+
+        run_id = str(ev.get("run_id", "")).strip()
+        if run_id:
+            run_id_values[run_id] += 1
+            run_match = run_id_regex.match(run_id)
+            if not run_match:
+                invalid_run_id_events += 1
+                violation_counts_by_day[event_day]["invalid_run_id"] += 1
+            else:
+                run_hash_prefix = str(run_match.groupdict().get("hash", "")).strip().lower()
+                normalized_hash = normalize_profile_hash(ev.get("profile_hash"))
+                if normalized_hash and run_hash_prefix:
+                    event_hash_prefix = normalized_hash.replace("sha256:", "")[:8]
+                    if run_hash_prefix != event_hash_prefix:
+                        run_id_hash_prefix_mismatch_events += 1
+                        violation_counts_by_day[event_day]["run_id_hash_prefix_mismatch"] += 1
+
+        schema_version = str(ev.get("schema_version", "")).strip()
+        if schema_version and schema_version != expected_schema_version:
+            schema_version_mismatch_events += 1
+            violation_counts_by_day[event_day]["schema_version_mismatch"] += 1
+        manifest_version = str(ev.get("manifest_version", "")).strip()
+        if manifest_version and manifest_version != expected_manifest_version:
+            manifest_version_mismatch_events += 1
+            violation_counts_by_day[event_day]["manifest_version_mismatch"] += 1
 
         if event_name == "position_closed" and "pnl_usd" in ev:
             pnl_rows.append((ts, as_float(ev.get("pnl_usd"), 0.0)))
@@ -539,6 +680,17 @@ def main() -> int:
             if not trade_id:
                 trade_id = f"{sess}::idx{idx}"
             session_trade_ids[sess].add(trade_id)
+            trade_key = (sess, trade_id)
+            if trade_key not in trade_first_day:
+                trade_first_day[trade_key] = event_day
+            side = str(ev.get("side", "")).strip().lower()
+            if side in {"long", "short"}:
+                trade_sides[trade_key].add(side)
+            if event_name == "order_submitted":
+                submit_ids.add(trade_key)
+            elif event_name == "order_filled":
+                fill_ids.add(trade_key)
+                fill_trade_day[trade_key] = event_day
 
             spread_pips = as_float(ev.get("spread_pips"), 0.0)
             local_max_spread_pips = as_float(ev.get("max_spread_pips"), max_spread_pips)
@@ -582,9 +734,46 @@ def main() -> int:
             else:
                 kill_switch_check_fail += 1
 
+        if event_name == "position_closed":
+            sess = session_key(ev, ts)
+            trade_id = str(ev.get("trade_id", "")).strip()
+            if not trade_id:
+                trade_id = f"{sess}::idx{idx}"
+            trade_key = (sess, trade_id)
+            close_ids.add(trade_key)
+            close_counts[trade_key] = int(close_counts.get(trade_key, 0) + 1)
+            close_trade_day[trade_key] = event_day
+            if trade_key not in trade_first_day:
+                trade_first_day[trade_key] = event_day
+            side = str(ev.get("side", "")).strip().lower()
+            if side in {"long", "short"}:
+                trade_sides[trade_key].add(side)
+
     session_cap_violations = int(
         sum(max(0, len(trade_ids) - max_trades_per_session) for trade_ids in session_trade_ids.values())
     )
+    fill_without_submit_ids = sorted([f"{run}::{tid}" for run, tid in (fill_ids - submit_ids)])
+    close_without_fill_ids = sorted([f"{run}::{tid}" for run, tid in (close_ids - fill_ids)])
+    duplicate_close_ids = sorted([f"{run}::{tid}" for (run, tid), n in close_counts.items() if int(n) > 1])
+    mixed_side_ids = sorted(
+        [f"{run}::{tid}" for (run, tid), sides in trade_sides.items() if len({s for s in sides if s}) > 1]
+    )
+    for trade_key in (fill_ids - submit_ids):
+        violation_counts_by_day[fill_trade_day.get(trade_key, trade_first_day.get(trade_key, "unknown"))][
+            "lifecycle_fill_without_submit"
+        ] += 1
+    for trade_key in (close_ids - fill_ids):
+        violation_counts_by_day[close_trade_day.get(trade_key, trade_first_day.get(trade_key, "unknown"))][
+            "lifecycle_close_without_fill"
+        ] += 1
+    for trade_key, count in close_counts.items():
+        if int(count) > 1:
+            violation_counts_by_day[close_trade_day.get(trade_key, trade_first_day.get(trade_key, "unknown"))][
+                "lifecycle_duplicate_close"
+            ] += 1
+    for trade_key, sides in trade_sides.items():
+        if len({s for s in sides if s}) > 1:
+            violation_counts_by_day[trade_first_day.get(trade_key, "unknown")]["lifecycle_mixed_side"] += 1
 
     pnl_values = [p for _, p in pnl_rows]
     trade_count = len(pnl_values)
@@ -599,7 +788,9 @@ def main() -> int:
     daily_pnl = daily_pnl_series(pnl_rows)
 
     event_times = [ts for ts, _ in enriched if ts is not None]
-    cli_start = parse_ts(str(args.window_start)) if str(args.window_start).strip() else None
+    first_event_ts = min(event_times) if event_times else None
+    last_event_ts = max(event_times) if event_times else None
+    cli_start = canonical_window_start
     cli_end = parse_ts(str(args.window_end)) if str(args.window_end).strip() else None
     window_start = cli_start or (min(event_times) if event_times else None)
     window_end = cli_end or (max(event_times) if event_times else None)
@@ -612,6 +803,16 @@ def main() -> int:
     reference_end = window_end or (utc_now() if event_times else None)
     if last_trade_ts is not None and reference_end is not None and reference_end >= last_trade_ts:
         last_trade_age_minutes = int((reference_end - last_trade_ts).total_seconds() // 60)
+    signal_count = as_int(event_counts.get("signal_evaluated"), 0)
+    closed_count = as_int(event_counts.get("position_closed"), 0)
+    if len(events) == 0:
+        ingestion_state = "NO_PIPELINE_INPUT"
+    elif signal_count == 0:
+        ingestion_state = "NO_SIGNALS"
+    elif closed_count == 0:
+        ingestion_state = "NO_TRADES"
+    else:
+        ingestion_state = "ACTIVE"
 
     paper_rules = profile.get("paper_validation_window", {}) if isinstance(profile.get("paper_validation_window"), dict) else {}
     min_days = as_int(paper_rules.get("min_days"), 0)
@@ -622,15 +823,54 @@ def main() -> int:
 
     stage_consistent = all(stage == expected_stage for stage in stage_values) if stage_values else True
     strategy_id_consistent = all(sid == expected_strategy_id for sid in strategy_values) if strategy_values else True
-    profile_hash_consistent = bool(events) and len(profile_hash_values) == 1 and profile_hash_missing_events == 0
+    has_events = bool(events)
+    # Day-0/no-input runs should be handled by ingestion checks, not treated as hash violations.
+    profile_hash_consistent = profile_hash_missing_events == 0 and (not has_events or len(profile_hash_values) == 1)
     profile_hash_matches_expected = (
-        bool(events)
-        and profile_hash_missing_events == 0
-        and (not expected_hashes or profile_hash_mismatch_events == 0)
+        profile_hash_missing_events == 0
+        and (
+            not has_events
+            or not expected_hashes
+            or profile_hash_mismatch_events == 0
+        )
     )
+    schema_version_matches_expected = schema_version_mismatch_events == 0
+    manifest_version_matches_expected = manifest_version_mismatch_events == 0
+    run_id_format_valid = invalid_run_id_events == 0
+    run_id_hash_prefix_valid = run_id_hash_prefix_mismatch_events == 0
+    monotonic_event_order_pass = bool(args.allow_non_monotonic or monotonic_order_violations == 0)
+    trade_lifecycle_complete = (
+        len(fill_without_submit_ids) == 0
+        and len(close_without_fill_ids) == 0
+        and len(duplicate_close_ids) == 0
+        and len(mixed_side_ids) == 0
+    )
+    contract_violation_counters = {
+        "schema_version_mismatch": int(schema_version_mismatch_events),
+        "manifest_version_mismatch": int(manifest_version_mismatch_events),
+        "invalid_run_id": int(invalid_run_id_events),
+        "run_id_hash_prefix_mismatch": int(run_id_hash_prefix_mismatch_events),
+        "profile_hash_mismatch": int(profile_hash_mismatch_events),
+        "profile_hash_missing": int(profile_hash_missing_events),
+        "monotonic_order_violations": int(monotonic_order_violations),
+        "lifecycle_fill_without_submit": int(len(fill_without_submit_ids)),
+        "lifecycle_close_without_fill": int(len(close_without_fill_ids)),
+        "lifecycle_duplicate_close": int(len(duplicate_close_ids)),
+        "lifecycle_mixed_side": int(len(mixed_side_ids)),
+    }
+    contract_violation_counters_by_day = {
+        day: dict(sorted(counter.items()))
+        for day, counter in sorted(violation_counts_by_day.items())
+    }
 
     summary: Dict[str, Any] = {
         "total_events": int(len(events)),
+        "source_events_total_unfiltered": int(source_events_total_unfiltered),
+        "source_events_excluded_before_window": int(source_events_excluded_before_window),
+        "canonical_window_start_utc": canonical_window_start.isoformat() if canonical_window_start else "",
+        "first_event_ts_utc": first_event_ts.isoformat() if first_event_ts else "",
+        "last_event_ts_utc": last_event_ts.isoformat() if last_event_ts else "",
+        "ingestion_state": ingestion_state,
         "trade_count": int(trade_count),
         "wins": int(wins),
         "losses": int(losses),
@@ -662,6 +902,25 @@ def main() -> int:
         "unknown_reason_code_events": int(unknown_reason_code_events),
         "profile_hash_missing_events": int(profile_hash_missing_events),
         "profile_hash_mismatch_events": int(profile_hash_mismatch_events),
+        "schema_version_expected": expected_schema_version,
+        "manifest_version_expected": expected_manifest_version,
+        "schema_version_mismatch_events": int(schema_version_mismatch_events),
+        "manifest_version_mismatch_events": int(manifest_version_mismatch_events),
+        "invalid_run_id_events": int(invalid_run_id_events),
+        "run_id_hash_prefix_mismatch_events": int(run_id_hash_prefix_mismatch_events),
+        "run_ids_seen": dict(run_id_values),
+        "monotonic_order_violations": int(monotonic_order_violations),
+        "monotonic_order_violation_examples": monotonic_order_examples,
+        "lifecycle_fill_without_submit_count": int(len(fill_without_submit_ids)),
+        "lifecycle_close_without_fill_count": int(len(close_without_fill_ids)),
+        "lifecycle_duplicate_close_count": int(len(duplicate_close_ids)),
+        "lifecycle_mixed_side_count": int(len(mixed_side_ids)),
+        "lifecycle_fill_without_submit_ids": fill_without_submit_ids[:20],
+        "lifecycle_close_without_fill_ids": close_without_fill_ids[:20],
+        "lifecycle_duplicate_close_ids": duplicate_close_ids[:20],
+        "lifecycle_mixed_side_ids": mixed_side_ids[:20],
+        "contract_violation_counters": contract_violation_counters,
+        "contract_violation_counters_by_day": contract_violation_counters_by_day,
         "profile_hash_values_seen": dict(profile_hash_values),
         "stage_values_seen": dict(stage_values),
         "strategy_values_seen": dict(strategy_values),
@@ -678,6 +937,12 @@ def main() -> int:
         "schema_reason_values_valid": unknown_reason_code_events == 0,
         "profile_hash_consistent": profile_hash_consistent,
         "profile_hash_matches_expected": profile_hash_matches_expected,
+        "schema_version_matches_expected": schema_version_matches_expected,
+        "manifest_version_matches_expected": manifest_version_matches_expected,
+        "run_id_format_valid": run_id_format_valid,
+        "run_id_hash_prefix_valid": run_id_hash_prefix_valid,
+        "monotonic_event_order_pass": monotonic_event_order_pass,
+        "trade_lifecycle_complete": trade_lifecycle_complete,
         "stage_consistent": stage_consistent,
         "strategy_id_consistent": strategy_id_consistent,
     }
@@ -694,6 +959,12 @@ def main() -> int:
         "schema_reason_values_valid",
         "profile_hash_consistent",
         "profile_hash_matches_expected",
+        "schema_version_matches_expected",
+        "manifest_version_matches_expected",
+        "run_id_format_valid",
+        "run_id_hash_prefix_valid",
+        "monotonic_event_order_pass",
+        "trade_lifecycle_complete",
         "stage_consistent",
         "strategy_id_consistent",
     ]
@@ -719,6 +990,7 @@ def main() -> int:
         "events_path": str(events_path.resolve()) if events_path else "",
         "status": status,
         "deployment_labels": deployment_labels,
+        "canonical_window_start_utc": canonical_window_start.isoformat() if canonical_window_start else "",
         "window_start_utc": window_start.isoformat() if window_start else "",
         "window_end_utc": window_end.isoformat() if window_end else "",
         "paper_days": int(paper_days),
@@ -731,8 +1003,13 @@ def main() -> int:
         },
         "event_contract": {
             "required_common_fields": required_common_fields,
+            "run_id_pattern": run_id_regex.pattern,
             "schema_events": sorted(schema_events),
             "schema_reason_codes": sorted(schema_reasons),
+        },
+        "contract_versions": {
+            "schema_version": expected_schema_version,
+            "manifest_version": expected_manifest_version,
         },
         "expected_profile_hashes": {
             "manifest_hash": manifest_profile_hash,

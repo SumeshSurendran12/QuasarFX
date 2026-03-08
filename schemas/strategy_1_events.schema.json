@@ -9,16 +9,23 @@
     "event",
     "stage",
     "strategy_id",
-    "profile_hash"
+    "profile_hash",
+    "schema_version",
+    "manifest_version"
   ],
   "properties": {
     "ts": {
       "type": "string",
       "format": "date-time"
     },
+    "process_start_ts": {
+      "type": "string",
+      "format": "date-time"
+    },
     "run_id": {
       "type": "string",
-      "minLength": 1
+      "minLength": 1,
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}_[A-Z0-9]+_sha[a-f0-9]{8}$"
     },
     "event": {
       "type": "string",
@@ -33,7 +40,9 @@
         "health_status",
         "kill_switch_check",
         "kill_switch_triggered",
-        "session_end"
+        "session_end",
+        "market_closed",
+        "data_feed_alive"
       ]
     },
     "stage": {
@@ -53,6 +62,14 @@
     "profile_hash": {
       "type": "string",
       "pattern": "^sha256:[a-fA-F0-9]{64}$"
+    },
+    "schema_version": {
+      "type": "string",
+      "const": "1.0.0"
+    },
+    "manifest_version": {
+      "type": "string",
+      "const": "1.0.0"
     },
     "reason_code": {
       "type": "string",
@@ -93,6 +110,12 @@
     },
     "decision": {
       "type": "string"
+    },
+    "last_price": {
+      "type": [
+        "number",
+        "null"
+      ]
     }
   },
   "allOf": [
@@ -288,6 +311,34 @@
           "trades",
           "net_pnl_usd",
           "status"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "event": {
+            "const": "market_closed"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "symbol"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "event": {
+            "const": "data_feed_alive"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "symbol"
         ]
       }
     }
