@@ -17,6 +17,7 @@ import numpy as np
 try:
     from .config import (
         DATA_FEED_HEARTBEAT_SECONDS,
+        GCAPI_CONFIG,
         MAX_POSITION_SIZE,
         MIN_POSITION_SIZE,
         MT5_CONFIG,
@@ -28,6 +29,7 @@ try:
 except ImportError:  # pragma: no cover - script mode fallback
     from config import (  # type: ignore[no-redef]
         DATA_FEED_HEARTBEAT_SECONDS,
+        GCAPI_CONFIG,
         MAX_POSITION_SIZE,
         MIN_POSITION_SIZE,
         MT5_CONFIG,
@@ -39,10 +41,12 @@ except ImportError:  # pragma: no cover - script mode fallback
 
 try:
     from .execution.base_adapter import ExecutionAdapter, OrderRequest, PositionState, Quote
+    from .execution.gcapi_adapter import GCAPIAdapter
     from .execution.mt5_adapter import MT5Adapter
     from .execution.paper_adapter import PaperAdapter
 except ImportError:  # pragma: no cover - script mode fallback
     from execution.base_adapter import ExecutionAdapter, OrderRequest, PositionState, Quote  # type: ignore[no-redef]
+    from execution.gcapi_adapter import GCAPIAdapter  # type: ignore[no-redef]
     from execution.mt5_adapter import MT5Adapter  # type: ignore[no-redef]
     from execution.paper_adapter import PaperAdapter  # type: ignore[no-redef]
 
@@ -58,8 +62,11 @@ EXECUTION_MODE_ALIASES = {
     "live": "mt5_live",
     "mt5": "mt5_demo",
     "demo": "mt5_demo",
+    "gcapi": "gcapi_demo",
+    "forexcom": "gcapi_demo",
+    "cityindex": "gcapi_demo",
 }
-SUPPORTED_EXECUTION_MODES = {"paper", "mt5_demo", "mt5_live"}
+SUPPORTED_EXECUTION_MODES = {"paper", "mt5_demo", "mt5_live", "gcapi_demo", "gcapi_live"}
 
 
 class _FallbackPaperModel:
@@ -171,8 +178,10 @@ class LiveTradingEnvironment:
         return mode
 
     def _default_broker_name(self) -> str:
+        if self.execution_mode.startswith("gcapi"):
+            return "forexcom_gcapi"
         if self.execution_mode == "paper":
-            return "gcapi_demo"
+            return "paper"
         return self.execution_mode
 
     def _resolve_magic_number(self) -> int:
@@ -199,6 +208,15 @@ class LiveTradingEnvironment:
                 logger=logger,
             )
 
+        if self.execution_mode in {"gcapi_demo", "gcapi_live"}:
+            return GCAPIAdapter(
+                symbol=self.symbol,
+                mode=self.execution_mode,
+                config=GCAPI_CONFIG,
+                order_comment_prefix=self.order_comment_prefix,
+                logger=logger,
+            )
+
         return MT5Adapter(
             symbol=self.symbol,
             mode=self.execution_mode,
@@ -219,7 +237,7 @@ class LiveTradingEnvironment:
                 with open(model_path, "rb") as handle:
                     return pickle.load(handle)
             except Exception as fallback_exc:
-                if self.execution_mode in {"paper", "mt5_demo"}:
+                if self.execution_mode in {"paper", "mt5_demo", "gcapi_demo"}:
                     logger.warning("Failed to load model from %s: %s", model_path, fallback_exc)
                     logger.warning("Using fallback policy for ingestion validation in %s mode.", self.execution_mode)
                     return _FallbackPaperModel()

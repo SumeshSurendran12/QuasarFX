@@ -1,0 +1,35 @@
+{
+  "include": [
+    "modules",
+    "tools",
+    "scripts",
+    "tests"
+  ],
+  "exclude": [
+    "**/__pycache__",
+    "**/.git",
+    "**/.pytest_cache",
+    "**/.mypy_cache",
+    "**/.ruff_cache",
+    "**/.ipynb_checkpoints",
+    ".venu",
+    ".venv",
+    "dashboard",
+    "node_modules",
+    "dist",
+    "build",
+    "logs",
+    "reports",
+    "artifacts",
+    "outputs",
+    "data",
+    "models"
+  ],
+  "venvPath": ".",
+  "venv": ".venu",
+  "pythonVersion": "3.13",
+  "typeCheckingMode": "basic",
+  "useLibraryCodeForTypes": true,
+  "reportMissingImports": "warning",
+  "reportMissingTypeStubs": "none"
+}

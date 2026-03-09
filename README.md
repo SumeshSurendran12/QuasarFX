@@ -240,6 +240,7 @@ Benchmark results (20,000 timesteps, Feb 7, 2026):
 - Paper mode report script: `scripts/paper_trading_mode_report.py`
 - Daily health report script: `scripts/daily_health_report.py`
 - Run ID generator: `scripts/generate_strategy_1_run_id.py`
+- MT5 diagnostics preflight script: `tools/mt5_diagnostics.py`
 - Daily pipeline runner: `scripts/run_daily_paper_pipeline.ps1`
 - Task scheduler registration script: `scripts/register_daily_paper_pipeline_task.ps1`
 
@@ -269,6 +270,12 @@ Schedule daily at 18:05 local time:
 powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\register_daily_paper_pipeline_task.ps1 -TaskName FX_Strategy1_DailyPipeline -StartTime 18:05
 ```
 
+Run MT5 preflight diagnostics (no live order is sent):
+
+```powershell
+python .\tools\mt5_diagnostics.py
+```
+
 If task registration fails with permissions, run the command in an elevated PowerShell session.
 
 ### Backtesting/Training
@@ -287,7 +294,7 @@ python live_trading.py
 
 > **Note:**  
 > - `main.py` is for backtesting/training only.  
-> - `live_trading.py` supports `FX_EXECUTION_MODE=paper` (default), `mt5_demo`, and `mt5_live`.
+> - `live_trading.py` supports `FX_EXECUTION_MODE=paper` (default), `mt5_demo`, `mt5_live`, `gcapi_demo`, and `gcapi_live`.
 > - Legacy `FX_EXECUTION_MODE=live` still works and maps to `mt5_live`.
 
 Paper session quick-start (Windows PowerShell):

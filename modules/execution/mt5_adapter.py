@@ -66,22 +66,51 @@ class MT5Adapter:
         init_kwargs: Dict[str, Any] = {}
         if self.terminal_path:
             init_kwargs["path"] = self.terminal_path
-        if self.login and self.password and self.server:
-            init_kwargs["login"] = safe_int(self.login, 0)
-            init_kwargs["password"] = self.password
-            init_kwargs["server"] = self.server
 
         if not mt5.initialize(**init_kwargs):
             raise RuntimeError(f"Failed to initialize MT5: {mt5.last_error()}")
 
         if self.login and self.password and self.server:
-            if not mt5.login(login=safe_int(self.login, 0), password=self.password, server=self.server):
-                raise RuntimeError(f"Failed MT5 login: {mt5.last_error()}")
+            requested_login = safe_int(self.login, 0)
+            current_account = mt5.account_info()
+            current_login = safe_int(getattr(current_account, "login", 0), 0)
+            current_server = str(getattr(current_account, "server", "") or "").strip().lower()
+            requested_server = str(self.server or "").strip().lower()
+
+            needs_login = current_account is None or current_login != requested_login
+            if requested_server and current_server and current_server != requested_server:
+                needs_login = True
+
+            if needs_login:
+                if not mt5.login(login=requested_login, password=self.password, server=self.server):
+                    raise RuntimeError(f"Failed MT5 login: {mt5.last_error()}")
 
         account_info = mt5.account_info()
         if account_info is not None:
             self.account_id = str(getattr(account_info, "login", "") or "")
             self.server_name = str(getattr(account_info, "server", "") or "")
+
+        terminal_info = mt5.terminal_info()
+        terminal_trade_allowed = bool(getattr(terminal_info, "trade_allowed", False)) if terminal_info is not None else False
+        terminal_tradeapi_disabled = bool(getattr(terminal_info, "tradeapi_disabled", False)) if terminal_info is not None else False
+        account_trade_allowed = bool(getattr(account_info, "trade_allowed", False)) if account_info is not None else False
+        account_trade_expert = bool(getattr(account_info, "trade_expert", False)) if account_info is not None else False
+
+        if not terminal_trade_allowed:
+            raise RuntimeError(
+                "MT5 terminal Algo Trading is disabled (terminal.trade_allowed=False). "
+                "Enable the toolbar Algo Trading button and Expert Advisors automation settings."
+            )
+        if terminal_tradeapi_disabled:
+            raise RuntimeError(
+                "MT5 terminal has external Python API trading disabled (terminal.tradeapi_disabled=True). "
+                "Disable this restriction in Tools -> Options -> Expert Advisors."
+            )
+        if not account_trade_allowed or not account_trade_expert:
+            raise RuntimeError(
+                "MT5 account does not permit expert trading (trade_allowed/trade_expert is false). "
+                "Verify broker account permissions and terminal Expert Advisors settings."
+            )
 
         available_symbols: List[str] = []
         symbols = mt5.symbols_get()

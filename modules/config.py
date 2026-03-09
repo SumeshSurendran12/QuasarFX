@@ -362,6 +362,21 @@ MT5_CONFIG = {
     'MT5_ORDER_COMMENT': os.getenv('MT5_ORDER_COMMENT', 'QuasarFX_Strategy1'),  # MT5 order comment root
 }
 
+GCAPI_CONFIG = {
+    'GCAPI_BASE_URL': os.getenv('GCAPI_BASE_URL', 'https://ciapi.cityindex.com/TradingAPI'),  # GCAPI REST base URL
+    'GCAPI_USERNAME': os.getenv('GCAPI_USERNAME', os.getenv('GCAPI_LOGIN', '')).strip(),  # GCAPI username/login
+    'GCAPI_PASSWORD': os.getenv('GCAPI_PASSWORD', '').strip(),  # GCAPI password
+    'GCAPI_APP_KEY': os.getenv('GCAPI_APP_KEY', os.getenv('GCAPI_APPKEY', '')).strip(),  # GCAPI application key
+    'GCAPI_APP_VERSION': os.getenv('GCAPI_APP_VERSION', '1').strip() or '1',  # GCAPI app version string
+    'GCAPI_APP_COMMENTS': os.getenv('GCAPI_APP_COMMENTS', 'QuasarFX_Strategy1').strip() or 'QuasarFX_Strategy1',  # GCAPI app comments tag
+    'GCAPI_TRADING_ACCOUNT_ID': os.getenv('GCAPI_TRADING_ACCOUNT_ID', '').strip(),  # Optional fixed trading account ID
+    'GCAPI_CLIENT_ACCOUNT_ID': os.getenv('GCAPI_CLIENT_ACCOUNT_ID', '').strip(),  # Optional fixed client account ID
+    'GCAPI_ORDER_REFERENCE': os.getenv('GCAPI_ORDER_REFERENCE', 'StoneX API').strip() or 'StoneX API',  # Reference field for order payloads
+    'GCAPI_SOURCE': os.getenv('GCAPI_SOURCE', 'quasarfx').strip(),  # Optional source tag for order payloads
+    'GCAPI_QUANTITY_MULTIPLIER': float(os.getenv('GCAPI_QUANTITY_MULTIPLIER', '100000')),  # Convert lot-style qty to units
+    'GCAPI_TIMEOUT_SECONDS': int(os.getenv('GCAPI_TIMEOUT_SECONDS', '15')),  # Per-request HTTP timeout
+}
+
 # === 10. Optimization/Hyperparameter Search ===
 MODEL_PARAMS = {
     'n_estimators': 100,  # Number of trees in ensemble models
