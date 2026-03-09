@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 import logging
 import os
 import pickle
+import sys
 import time
 import zlib
 from typing import Any, Dict, Optional, Tuple
@@ -125,6 +126,7 @@ class LiveTradingEnvironment:
         self.magic = self._resolve_magic_number()
         self.session_closed = False
         self._shutdown_done = False
+        self.sb3_model_load_status = "unknown"
 
         self.event_logger = Strategy1CanonicalEventLogger(
             session_label=self.session_label,
@@ -139,6 +141,12 @@ class LiveTradingEnvironment:
         self.adapter.connect()
 
         self.model = self._load_model(model_path)
+        logger.info(
+            "Runtime context python_executable=%s sb3_model_load=%s execution_mode=%s",
+            sys.executable,
+            self.sb3_model_load_status,
+            self.execution_mode,
+        )
         self._sync_position_state()
 
         session_start_fields: Dict[str, Any] = {
@@ -227,19 +235,49 @@ class LiveTradingEnvironment:
         )
 
     def _load_model(self, model_path: str) -> Any:
+        flag = str(os.getenv("FX_DISABLE_SB3_MODEL_LOAD", "auto")).strip().lower()
+
+        if flag == "true":
+            disable_sb3 = True
+        elif flag == "false":
+            disable_sb3 = False
+        else:  # auto
+            disable_sb3 = sys.version_info >= (3, 13)
+
+        if disable_sb3:
+            logger.warning(
+                "SB3 model load disabled (Python %s detected). Using fallback policy.",
+                sys.version.split()[0],
+            )
+            if self.execution_mode in {"paper", "mt5_demo", "gcapi_demo"}:
+                self.sb3_model_load_status = "disabled_fallback"
+                return _FallbackPaperModel()
+            raise RuntimeError(
+                "SB3 model load is disabled for this runtime. Use Python 3.11 environment "
+                "(.venv/.venv311) for live model execution, or set FX_DISABLE_SB3_MODEL_LOAD=false "
+                "to force SB3 loading."
+            )
+        else:
+            logger.info("Loading SB3 model: %s", model_path)
+
         try:
             from stable_baselines3 import PPO
 
-            return PPO.load(model_path)
+            model = PPO.load(model_path)
+            self.sb3_model_load_status = "enabled"
+            return model
         except Exception as exc:
             logger.warning("Failed to load as stable-baselines3 model: %s", exc)
             try:
                 with open(model_path, "rb") as handle:
-                    return pickle.load(handle)
+                    model = pickle.load(handle)
+                    self.sb3_model_load_status = "pickle_fallback"
+                    return model
             except Exception as fallback_exc:
                 if self.execution_mode in {"paper", "mt5_demo", "gcapi_demo"}:
                     logger.warning("Failed to load model from %s: %s", model_path, fallback_exc)
                     logger.warning("Using fallback policy for ingestion validation in %s mode.", self.execution_mode)
+                    self.sb3_model_load_status = "load_failed_fallback"
                     return _FallbackPaperModel()
                 raise RuntimeError(f"Cannot load model from {model_path}: {fallback_exc}") from fallback_exc
 

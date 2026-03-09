@@ -1,6 +1,7 @@
 {
   "git.ignoreLimitWarning": true,
   "python.defaultInterpreterPath": "${workspaceFolder}\\.venu\\Scripts\\python.exe",
+  "python.envFile": "${workspaceFolder}\\.env",
   "python.terminal.useEnvFile": true,
   "python.analysis.typeCheckingMode": "basic",
   "python.analysis.autoImportCompletions": true,
