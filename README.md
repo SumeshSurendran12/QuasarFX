@@ -286,8 +286,8 @@ python live_trading.py
 
 > **Note:**  
 > - `main.py` is for backtesting/training only.  
-> - `live_trading.py` supports canonical paper-event emission via `FX_EXECUTION_MODE=paper` (default).
-> - Set `FX_EXECUTION_MODE=live` only when you explicitly want live order routing.
+> - `live_trading.py` supports `FX_EXECUTION_MODE=paper` (default), `mt5_demo`, and `mt5_live`.
+> - Legacy `FX_EXECUTION_MODE=live` still works and maps to `mt5_live`.
 
 Paper session quick-start (Windows PowerShell):
 ```powershell

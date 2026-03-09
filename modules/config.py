@@ -146,6 +146,7 @@ LOW_EXPECTANCY_CLOSE_PENALTY_SCALE = float(os.getenv("FX_LOW_EXPECTANCY_CLOSE_PE
 STRATEGY_1_NAME = os.getenv("FX_STRATEGY_1_NAME", "London Compression Breakout (Low Spread Only)")
 STRATEGY_1_LIVE_MAX_SPREAD = float(os.getenv("FX_STRATEGY_1_LIVE_MAX_SPREAD", "0.00022"))  # Skip entries when live spread exceeds this threshold
 DATA_FEED_HEARTBEAT_SECONDS = int(os.getenv("FX_DATA_FEED_HEARTBEAT_SECONDS", "60"))  # Emit data feed heartbeat event every N seconds
+FX_EXECUTION_MODE = os.getenv("FX_EXECUTION_MODE", "paper").strip().lower()
 
 # === 6. Training/Backtesting Parameters ===
 MAX_EPISODES = 2200000  # Maximum number of training episodes
@@ -347,14 +348,18 @@ MT5_CONFIG = {
     'MT5LOGIN': os.getenv('MT5_LOGIN'),  # MT5 account number
     'MT5PASSWORD': os.getenv('MT5_PASSWORD'),  # MT5 password
     'MT5SERVER': os.getenv('MT5_SERVER'),  # MT5 broker server
-    'MT5SYMBOL': "EURUSD",  # MT5 trading symbol
-    'MT5TIMEFRAME': "M15",  # MT5 trading timeframe
+    'MT5_TERMINAL_PATH': os.getenv('MT5_TERMINAL_PATH', ''),  # Optional local MT5 terminal executable path
+    'MT5SYMBOL': os.getenv('MT5_SYMBOL', "EURUSD"),  # MT5 trading symbol
+    'MT5TIMEFRAME': os.getenv('MT5_TIMEFRAME', "M15"),  # MT5 trading timeframe
     'MODEL_PATH': str(Path(__file__).parent.parent / "models" / "best_model.zip"),  # Path to trained model
     'BASE_DEVIATION': 20,  # Base deviation in points
     'MAX_DEVIATION': 50,  # Max allowed deviation in points
     'MIN_DEVIATION': 10,  # Min allowed deviation in points
     'MAGIC_BASE': 234000,  # Base magic number for orders
-    'COMMENT': "python script"  # Order comment for MT5
+    'COMMENT': "python script",  # Legacy default comment for MT5
+    'MT5_MAGIC_NUMBER': int(os.getenv('MT5_MAGIC_NUMBER', '51001')),  # Optional fixed MT5 magic override
+    'MT5_DEVIATION_POINTS': int(os.getenv('MT5_DEVIATION_POINTS', '20')),  # Order deviation points
+    'MT5_ORDER_COMMENT': os.getenv('MT5_ORDER_COMMENT', 'QuasarFX_Strategy1'),  # MT5 order comment root
 }
 
 # === 10. Optimization/Hyperparameter Search ===
