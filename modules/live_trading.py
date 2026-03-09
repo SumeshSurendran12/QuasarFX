@@ -677,11 +677,24 @@ class LiveTradingEnvironment:
         if action == 3 and self.position == 0:
             logger.info("Action CLOSE ignored (no open position)")
 
-    def _log_action(self, action: int, price: float) -> None:
+    def _log_action(self, action: int, price: float, raw_action: Any = None) -> None:
         now = time.time()
         if self.last_action is None or action != self.last_action or (now - self.last_action_log) >= self.action_log_interval:
             action_names = {0: "HOLD", 1: "BUY", 2: "SELL", 3: "CLOSE"}
-            logger.info("Action: %s | position=%s | price=%.5f", action_names.get(action, action), self.position, price)
+            raw_repr = raw_action
+            try:
+                if raw_action is not None:
+                    arr = np.asarray(raw_action)
+                    raw_repr = arr.tolist() if arr.size > 1 else arr.item()
+            except Exception:
+                raw_repr = raw_action
+            logger.info(
+                "Action: %s | raw_action=%s | position=%s | price=%.5f",
+                action_names.get(action, action),
+                raw_repr,
+                self.position,
+                price,
+            )
             self.last_action = action
             self.last_action_log = now
 
@@ -729,7 +742,7 @@ class LiveTradingEnvironment:
                 observation = self.get_observation(quote)
                 action_raw, _ = self.model.predict(observation, deterministic=True)
                 action = self._action_to_int(action_raw)
-                self._log_action(action, float(observation[3]))
+                self._log_action(action, float(observation[3]), raw_action=action_raw)
                 self._emit_signal_candidate(action=action, quote=quote)
                 self.execute_trade(action, quote=quote)
                 self.wait_for_next_tick()
