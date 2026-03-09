@@ -297,6 +297,31 @@ cd modules
 python live_trading.py
 ```
 
+### Dashboard (Local Frontend)
+
+Strategy 1 weekly monitoring UI is available in `dashboard/` (Vite + React + TypeScript).
+
+Run locally:
+
+```bash
+cd dashboard
+npm install
+npm run dev
+```
+
+Build production bundle:
+
+```bash
+cd dashboard
+npm run build
+```
+
+Open the app in your browser and upload/paste:
+- `daily_health.json` (from daily health pipeline output)
+- `paper_report.json` (from paper mode report output)
+
+Use **Load demo data** to preview the charts without live files.
+
 ### Model Saving and Live Trading
 
 - After training, models are saved in the `models/` folder.
