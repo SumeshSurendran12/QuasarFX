@@ -16,7 +16,7 @@ import pandas as pd
 import numpy as np
 import random
 from stable_baselines3 import PPO
-from stable_baselines3.common.vec_env import DummyVecEnv
+from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv
 from stable_baselines3.common.callbacks import BaseCallback
 from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.utils import set_random_seed
@@ -24,29 +24,65 @@ from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 import gymnasium as gym
 from gymnasium import spaces
 import wandb
-from model import TradingEnvironment
-from debug import DebugLogger
+try:
+    from .model import TradingEnvironment
+    from .debug import DebugLogger
+    from .config import (
+        MIN_POSITION_SIZE, MAX_POSITION_SIZE, SYMBOL, TIMEFRAME, YEARS,
+        MAX_EPISODES, MAX_TIMESTEPS, MIN_EPISODES, TARGET_WEEKLY_PROFIT, MAX_TRADES_PER_WEEK,
+        BATCH_SIZE, N_STEPS,
+        REWARD_SHAPING,
+        INITIAL_LR, FINAL_LR, MIN_LR, WARMUP_STEPS,
+        DEVICE_TYPE,
+        PPO_PARAMS,
+        PPO_VERBOSE,
+        EPISODE_LENGTH,
+        GRID_SEARCH_PARAMS,
+        RESUME_FROM_BEST,
+        RESUME_FROM_PATH,
+        LOCK_FILE_ENABLED,
+        LOCK_FILE_PATH,
+        BASE_DIR,
+        NUM_ENVS,
+        VEC_ENV_TYPE,
+        USE_CUSTOM_REWARD_WRAPPER,
+        ENTROPY_SCHEDULE_ENABLED,
+        ENTROPY_START_COEF,
+        ENTROPY_END_COEF,
+        ENTROPY_WARMUP_FRACTION,
+    )
+    from .data_fetcher import DataFetcher
+except ImportError:  # pragma: no cover - script mode fallback
+    from model import TradingEnvironment  # type: ignore[no-redef]
+    from debug import DebugLogger  # type: ignore[no-redef]
+    from config import (  # type: ignore[no-redef]
+        MIN_POSITION_SIZE, MAX_POSITION_SIZE, SYMBOL, TIMEFRAME, YEARS,
+        MAX_EPISODES, MAX_TIMESTEPS, MIN_EPISODES, TARGET_WEEKLY_PROFIT, MAX_TRADES_PER_WEEK,
+        BATCH_SIZE, N_STEPS,
+        REWARD_SHAPING,
+        INITIAL_LR, FINAL_LR, MIN_LR, WARMUP_STEPS,
+        DEVICE_TYPE,
+        PPO_PARAMS,
+        PPO_VERBOSE,
+        EPISODE_LENGTH,
+        GRID_SEARCH_PARAMS,
+        RESUME_FROM_BEST,
+        RESUME_FROM_PATH,
+        LOCK_FILE_ENABLED,
+        LOCK_FILE_PATH,
+        BASE_DIR,
+        NUM_ENVS,
+        VEC_ENV_TYPE,
+        USE_CUSTOM_REWARD_WRAPPER,
+        ENTROPY_SCHEDULE_ENABLED,
+        ENTROPY_START_COEF,
+        ENTROPY_END_COEF,
+        ENTROPY_WARMUP_FRACTION,
+    )
+    from data_fetcher import DataFetcher  # type: ignore[no-redef]
 import torch
 import torch.nn as nn
-from config import (
-    MIN_POSITION_SIZE, MAX_POSITION_SIZE, SYMBOL, TIMEFRAME, YEARS,
-    MAX_EPISODES, MAX_TIMESTEPS, MIN_EPISODES, TARGET_WEEKLY_PROFIT, MAX_TRADES_PER_WEEK,
-    BATCH_SIZE, N_STEPS,
-    REWARD_SHAPING,
-    INITIAL_LR, FINAL_LR, MIN_LR, WARMUP_STEPS,
-    DEVICE_TYPE,
-    PPO_PARAMS,
-    PPO_VERBOSE,
-    EPISODE_LENGTH,
-    GRID_SEARCH_PARAMS,
-    RESUME_FROM_BEST,
-    RESUME_FROM_PATH,
-    LOCK_FILE_ENABLED,
-    LOCK_FILE_PATH,
-    BASE_DIR
-)
 import json
-from data_fetcher import DataFetcher
 
 
 
@@ -386,18 +422,42 @@ class CustomRewardWrapper(gym.Wrapper):
         self.position_size = MIN_POSITION_SIZE  # Reset to minimum position size
         return observation, info
 
-def make_env(rank, df, seed=0, reward_config=None):
+def make_env(rank, df, seed=0, reward_config=None, mode="train", use_custom_reward_wrapper=None):
     """
     Create a new environment instance
     """
     def _init():
-        env = TradingEnvironment(df.copy())  # Use a copy for each environment
+        env = TradingEnvironment(df.copy(), mode=mode)  # Use a copy for each environment
         env = Monitor(env, f"logs/monitor-{rank}")
-        env = CustomRewardWrapper(env, reward_config or REWARD_SHAPING)
+        wrapper_enabled = USE_CUSTOM_REWARD_WRAPPER if use_custom_reward_wrapper is None else bool(use_custom_reward_wrapper)
+        if wrapper_enabled:
+            env = CustomRewardWrapper(env, reward_config or REWARD_SHAPING)
         env.reset(seed=seed + rank)
         return env
     set_random_seed(seed)
     return _init
+
+def create_vectorized_env(df, seed=0, reward_config=None, num_envs=None, vec_env_type=None, mode="train", use_custom_reward_wrapper=None):
+    """Create vectorized training environments from config or explicit overrides."""
+    resolved_num_envs = max(int(NUM_ENVS if num_envs is None else num_envs), 1)
+    resolved_vec_env_type = str(VEC_ENV_TYPE if vec_env_type is None else vec_env_type).strip().lower()
+    if resolved_vec_env_type not in {"dummy", "subproc"}:
+        resolved_vec_env_type = "dummy"
+
+    env_fns = [
+        make_env(
+            i,
+            df,
+            seed=seed,
+            reward_config=reward_config,
+            mode=mode,
+            use_custom_reward_wrapper=use_custom_reward_wrapper,
+        )
+        for i in range(resolved_num_envs)
+    ]
+    if resolved_num_envs == 1 or resolved_vec_env_type == "dummy":
+        return DummyVecEnv(env_fns)
+    return SubprocVecEnv(env_fns)
 
 def get_base_env(env):
     """Get the base environment without wrappers"""
@@ -447,6 +507,20 @@ class ProgressCallback(BaseCallback):
         self.last_step_count = 0
         self.steps_per_sec = 0.0
         self.progress_tracker = progress_tracker
+
+    def _get_trade_history(self):
+        try:
+            trade_histories = self.training_env.get_attr("trade_history")  # type: ignore[attr-defined]
+            if trade_histories:
+                return trade_histories[0]
+        except Exception:
+            pass
+
+        try:
+            env = get_base_env(self.training_env.envs[0])  # type: ignore[attr-defined]
+            return getattr(env, "trade_history", [])
+        except Exception:
+            return []
 
     def _calculate_trade_stats(self, trade_history):
         """Calculate trade statistics"""
@@ -601,9 +675,7 @@ class ProgressCallback(BaseCallback):
             avg_length = np.mean(self.episode_lengths[-100:]) if self.episode_lengths else 0
 
         # Get trade history from the environment
-            env = get_base_env(self.training_env.envs[0]) # type: ignore
-            if hasattr(env, 'trade_history'):
-                self.trade_history = env.trade_history
+            self.trade_history = list(self._get_trade_history())
             
             eta_seconds = None
             if self.total_timesteps is not None and self.steps_per_sec > 0:
@@ -744,6 +816,32 @@ class LearningRateMonitor(BaseCallback):
         
         return True
 
+class EntropyScheduleCallback(BaseCallback):
+    """Keep entropy high early, then anneal toward a lower final coefficient."""
+
+    def __init__(self, total_timesteps, start_coef, end_coef, warmup_fraction=0.2, verbose=0):
+        super().__init__(verbose)
+        self.total_timesteps = max(int(total_timesteps), 1)
+        self.start_coef = float(start_coef)
+        self.end_coef = float(end_coef)
+        self.warmup_fraction = min(max(float(warmup_fraction), 0.0), 0.95)
+
+    def _current_entropy_coef(self) -> float:
+        progress = min(max(self.num_timesteps / self.total_timesteps, 0.0), 1.0)
+        if progress <= self.warmup_fraction:
+            return self.start_coef
+        decay_progress = (progress - self.warmup_fraction) / max(1.0 - self.warmup_fraction, 1e-9)
+        return self.start_coef + (self.end_coef - self.start_coef) * decay_progress
+
+    def _on_step(self) -> bool:
+        current_coef = self._current_entropy_coef()
+        self.model.ent_coef = current_coef
+        try:
+            wandb.log({"entropy_coef": current_coef, "num_timesteps": self.num_timesteps})
+        except Exception:
+            pass
+        return True
+
 def split_train_val_test(df, val_fraction=0.1, test_fraction=0.1):
     """Split data into train/val/test sets preserving time order."""
     if not 0.0 < val_fraction < 1.0 or not 0.0 < test_fraction < 1.0:
@@ -780,7 +878,7 @@ def evaluate_model(model, eval_df, tag="eval"):
         logger.warning("Evaluation skipped: eval_df is empty.")
         return {}
 
-    env = TradingEnvironment(eval_df.copy())
+    env = TradingEnvironment(eval_df.copy(), mode="eval", apply_action_shaping=False)
     obs, _ = env.reset()
     data_len = len(env.data['close'])
 
@@ -866,6 +964,8 @@ def _build_model(env, hyperparams=None, verbose_override=None):
     n_steps = hyperparams.get('n_steps', N_STEPS)
     batch_size = hyperparams.get('batch_size', BATCH_SIZE)
     learning_rate = hyperparams.get('learning_rate', learning_rate_schedule(0))
+    if ENTROPY_SCHEDULE_ENABLED and 'ent_coef' not in hyperparams:
+        params['ent_coef'] = ENTROPY_START_COEF
     verbose = PPO_VERBOSE if verbose_override is None else verbose_override
 
     model = PPO(
@@ -931,7 +1031,7 @@ def _selection_score(metrics):
 
 def _train_single_model(train_df, seed, hyperparams, timesteps, callbacks=None, verbose_override=None):
     set_random_seed(seed)
-    env = DummyVecEnv([make_env(0, train_df, seed=seed, reward_config=REWARD_SHAPING)])
+    env = create_vectorized_env(train_df, seed=seed, reward_config=REWARD_SHAPING, mode="train")
     model = _build_model(env, hyperparams=hyperparams, verbose_override=verbose_override)
     model.learn(total_timesteps=timesteps, callback=callbacks or [])
     return model, env
@@ -1025,14 +1125,14 @@ def train():
 
     # Create vectorized environment
     train_full_df = pd.concat([train_df, val_df]).copy()
-    env = DummyVecEnv([make_env(i, train_full_df, reward_config=REWARD_SHAPING) for i in range(1)])
+    env = create_vectorized_env(train_full_df, reward_config=REWARD_SHAPING, mode="train")
 
     # Create or resume model
     model = _load_or_build_model(env, hyperparams=selected_params, allow_resume=True)
 
     # Create callbacks
     def _make_callbacks(total_timesteps):
-        return [
+        callbacks = [
             ProgressCallback(
                 debug_logger,
                 update_interval=10,
@@ -1041,6 +1141,16 @@ def train():
             ),
             LearningRateMonitor()
         ]
+        if ENTROPY_SCHEDULE_ENABLED:
+            callbacks.append(
+                EntropyScheduleCallback(
+                    total_timesteps=total_timesteps,
+                    start_coef=ENTROPY_START_COEF,
+                    end_coef=ENTROPY_END_COEF,
+                    warmup_fraction=ENTROPY_WARMUP_FRACTION,
+                )
+            )
+        return callbacks
     
     # Train model
     model.learn(

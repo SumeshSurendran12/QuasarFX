@@ -1422,7 +1422,7 @@ def evaluate_model(model, df: pd.DataFrame, n_episodes=10):
     """Evaluate model performance over multiple episodes"""
     if df is None or df.empty:
         raise ValueError("evaluate_model requires a non-empty DataFrame.")
-    env = TradingEnvironment(df)
+    env = TradingEnvironment(df, mode="eval", apply_action_shaping=False)
     data_len = len(env.data['close'])
     rewards = []
     for _ in range(n_episodes):
@@ -1430,7 +1430,7 @@ def evaluate_model(model, df: pd.DataFrame, n_episodes=10):
         done = False
         episode_reward = 0
         while not done and (env.current_step + 1) < data_len:
-            action, _ = model.predict(obs)
+            action, _ = model.predict(obs, deterministic=True)
             obs, reward, done, _, _ = env.step(action)
             episode_reward += reward
         rewards.append(episode_reward)

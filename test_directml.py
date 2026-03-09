@@ -1,7 +1,10 @@
-import torch
 import pytest
 
 def test_directml():
+    torch = pytest.importorskip(
+        "torch",
+        reason="PyTorch is not installed in this environment.",
+    )
     torch_directml = pytest.importorskip(
         "torch_directml",
         reason="torch_directml is not installed in this environment.",

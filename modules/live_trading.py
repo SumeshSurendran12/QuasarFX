@@ -20,6 +20,7 @@ import time
 import logging
 import pickle
 import os
+import zlib
 from types import SimpleNamespace
 from typing import Any, Dict, List, Tuple, Optional
 try:
@@ -78,6 +79,21 @@ class _FallbackPaperModel:
 
 
 class LiveTradingEnvironment:
+    def _resolve_magic_number(self) -> int:
+        raw_magic = str(os.getenv("FX_MAGIC_NUMBER", "")).strip()
+        if raw_magic:
+            try:
+                return int(raw_magic)
+            except ValueError:
+                logger.warning(f"Invalid FX_MAGIC_NUMBER={raw_magic!r}; using deterministic strategy magic.")
+
+        strategy_key = f"{STRATEGY_1_NAME}:{self.symbol}".encode("utf-8")
+        return int(MT5_CONFIG['MAGIC_BASE']) + int(zlib.crc32(strategy_key) % 1000)
+
+    @staticmethod
+    def _build_order_comment(prefix: str, action: str) -> str:
+        return f"{prefix}|{action}"[:31]
+
     def _ensure_mt5_connection(self):
         """Initialize MT5 when instantiated outside the script entrypoint."""
         if not MT5_AVAILABLE:
@@ -140,10 +156,8 @@ class LiveTradingEnvironment:
         self._last_synthetic_tick: Optional[Any] = None
         self.data_feed_heartbeat_seconds = max(1, int(DATA_FEED_HEARTBEAT_SECONDS))
         self.last_feed_heartbeat = 0.0
-        
-        # Generate unique magic number for this bot instance
-        import random
-        self.magic = MT5_CONFIG['MAGIC_BASE'] + random.randint(1, 9999)
+        self.order_comment_prefix = str(os.getenv("FX_ORDER_COMMENT_PREFIX", "QFX-S1")).strip() or "QFX-S1"
+        self.magic = self._resolve_magic_number()
         
         # If this class is used directly (e.g. ad-hoc smoke tests), initialize MT5 here.
         self._ensure_mt5_connection()
@@ -181,7 +195,7 @@ class LiveTradingEnvironment:
         )
         
         logger.info(f"Initialized live trading for {symbol} using model from {model_path}")
-        logger.info(f"Bot instance magic number: {self.magic}")
+        logger.info(f"Strategy magic number: {self.magic}")
         logger.info(f"[STRATEGY1] run_id={self.event_logger.run_id}")
         logger.info(f"Canonical mode={self.execution_mode} events={self.event_logger.events_path}")
 
@@ -432,11 +446,21 @@ class LiveTradingEnvironment:
         return np.clip(position_size, MIN_POSITION_SIZE, MAX_POSITION_SIZE)
 
     def _get_symbol_positions(self):
-        """Get open positions for this bot instance (symbol + magic, FIFO safe)."""
+        """Get open positions for this bot instance using stable strategy identity."""
         if not MT5_AVAILABLE:
             return []
-        positions = mt5.positions_get(symbol=self.symbol, magic=self.magic)
-        return list(positions) if positions else []
+        positions = mt5.positions_get(symbol=self.symbol)
+        if positions is None:
+            logger.warning(f"positions_get failed for {self.symbol}: {mt5.last_error()}")
+            return []
+
+        managed_positions = []
+        for position in positions:
+            position_magic = int(getattr(position, "magic", 0) or 0)
+            position_comment = str(getattr(position, "comment", "") or "")
+            if position_magic == self.magic or position_comment.startswith(self.order_comment_prefix):
+                managed_positions.append(position)
+        return managed_positions
 
     @staticmethod
     def _utc_iso() -> str:
@@ -810,12 +834,15 @@ class LiveTradingEnvironment:
             "tp": tp,
             "deviation": self.calculate_dynamic_deviation(),
             "magic": self.magic,
-            "comment": MT5_CONFIG['COMMENT'] + " open",
+            "comment": self._build_order_comment(self.order_comment_prefix, "open"),
             "type_time": mt5.ORDER_TIME_GTC,
             "type_filling": mt5.ORDER_FILLING_FOK,
         }
 
         result = mt5.order_send(request)
+        if result is None:
+            logger.error(f"Failed to open position: order_send returned None ({mt5.last_error()})")
+            return False
         if result.retcode != mt5.TRADE_RETCODE_DONE:
             logger.error(f"Failed to open position: {result.comment}")
             return False
@@ -916,12 +943,15 @@ class LiveTradingEnvironment:
             "price": close_tick.bid if position.type == MT5_ORDER_TYPE_BUY else close_tick.ask,
             "deviation": self.calculate_dynamic_deviation(),
             "magic": self.magic,
-            "comment": MT5_CONFIG['COMMENT'] + " close",
+            "comment": self._build_order_comment(self.order_comment_prefix, "close"),
             "type_time": mt5.ORDER_TIME_GTC,
             "type_filling": mt5.ORDER_FILLING_FOK,
         }
 
         result = mt5.order_send(request)
+        if result is None:
+            logger.error(f"Failed to close position: order_send returned None ({mt5.last_error()})")
+            return False
         if result.retcode != mt5.TRADE_RETCODE_DONE:
             logger.error(f"Failed to close position: {result.comment}")
             return False
@@ -963,9 +993,7 @@ class LiveTradingEnvironment:
         return True
     def _get_position_ticket(self):
         """Get the current position ticket for this bot instance."""
-        if not MT5_AVAILABLE:
-            return None
-        positions = mt5.positions_get(symbol=self.symbol, magic=self.magic)
+        positions = self._get_symbol_positions()
         if positions:
             return positions[0].ticket
         return None
@@ -983,10 +1011,18 @@ class LiveTradingEnvironment:
             oldest = min(positions, key=lambda p: p.time)
             self.position = 1 if oldest.type == MT5_ORDER_TYPE_BUY else -1
             self.entry_price = oldest.price_open
+            self.current_trade = {
+                "trade_id": f"S1-{datetime.now().strftime('%Y%m%d')}-{int(oldest.ticket)}",
+                "side": "long" if self.position > 0 else "short",
+                "qty": float(getattr(oldest, "volume", 0.0) or 0.0),
+                "entry_price": float(oldest.price_open),
+                "entry_ts": datetime.fromtimestamp(int(oldest.time), tz=timezone.utc),
+            }
             logger.info(f"Synced with existing position (FIFO oldest): {'long' if self.position > 0 else 'short'} at {self.entry_price}")
         else:
             self.position = 0
             self.entry_price = 0
+            self.current_trade = None
             logger.info("No existing positions found, starting with neutral state")
     
     def wait_for_next_tick(self):
