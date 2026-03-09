@@ -109,11 +109,19 @@ class Strategy1CanonicalEventLogger:
             )
         }
 
-        profile_hash = ""
+        manifest_hash = ""
         if self.manifest_path.exists():
-            profile_hash = f"sha256:{_canonical_sha256(self.manifest_path)}"
-        elif self.profile_path.exists():
+            manifest_hash = f"sha256:{_canonical_sha256(self.manifest_path)}"
+        if not manifest_hash:
+            manifest_hash = f"sha256:{'0' * 64}"
+        self.manifest_hash = manifest_hash
+
+        profile_hash = ""
+        if self.profile_path.exists():
             profile_hash = f"sha256:{_canonical_sha256(self.profile_path)}"
+        elif self.manifest_path.exists():
+            # Backward-compatible fallback when profile file is unavailable.
+            profile_hash = self.manifest_hash
         if not profile_hash:
             profile_hash = f"sha256:{'0' * 64}"
         self.profile_hash = profile_hash
@@ -176,6 +184,7 @@ class Strategy1CanonicalEventLogger:
             "stage": self.stage,
             "strategy_id": self.strategy_id,
             "profile_hash": self.profile_hash,
+            "manifest_hash": self.manifest_hash,
             "schema_version": self.schema_version,
             "manifest_version": self.manifest_version,
             "process_start_ts": self.process_start_ts,

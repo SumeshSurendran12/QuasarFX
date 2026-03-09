@@ -232,6 +232,7 @@ Benchmark results (20,000 timesteps, Feb 7, 2026):
 - Canonical runtime logs: `events.jsonl` + `daily_summary.json`
 - Canonical run_id format: `YYYY-MM-DD_SESSION_shaXXXXXXXX` (example: `2026-03-07_LONDON_sha9f2c1ab4`)
 - Frozen reason_code vocabulary: `signal_pass`, `spread_gate`, `session_cap`, `daily_loss_limit`, `max_open_positions`, `outside_session`, `cooldown_active`, `duplicate_signal`, `no_liquidity`, `manual_disable`, `policy_breach`, `within_limits`, `broker_api_failure`
+- Deterministic config hashes on every event: `profile_hash` + `manifest_hash`
 - Contract versions on every event: `schema_version=1.0.0`, `manifest_version=1.0.0`
 - Deployment checklist: `docs/strategy_1_deployment_checklist.md`
 - Kill-switch policy: `docs/kill_switch_policy.md`

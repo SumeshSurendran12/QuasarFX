@@ -12,7 +12,17 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 ROOT = Path(__file__).resolve().parents[1]
 
-DEFAULT_COMMON_FIELDS = ["ts", "run_id", "event", "stage", "strategy_id", "profile_hash", "schema_version", "manifest_version"]
+DEFAULT_COMMON_FIELDS = [
+    "ts",
+    "run_id",
+    "event",
+    "stage",
+    "strategy_id",
+    "profile_hash",
+    "manifest_hash",
+    "schema_version",
+    "manifest_version",
+]
 DEFAULT_SCHEMA_VERSION = "1.0.0"
 DEFAULT_MANIFEST_VERSION = "1.0.0"
 RUN_ID_REGEX = re.compile(r"^(?P<date>\d{4}-\d{2}-\d{2})_(?P<session>[A-Z0-9]+)_sha(?P<hash>[a-f0-9]{8})$")
@@ -218,6 +228,15 @@ def normalize_profile_hash(value: Any) -> str:
     return f"sha256:{text}"
 
 
+def normalize_manifest_hash(value: Any) -> str:
+    text = str(value or "").strip().lower()
+    if not text:
+        return ""
+    if text.startswith("sha256:"):
+        return text
+    return f"sha256:{text}"
+
+
 def canonical_json_sha256(path: Path) -> str:
     payload = json.loads(path.read_text(encoding="utf-8"))
     data = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
@@ -394,6 +413,7 @@ def to_markdown(payload: Dict[str, Any]) -> str:
         f"- unknown_event_value_events: `{as_int(s.get('unknown_event_value_events'))}`",
         f"- unknown_reason_code_events: `{as_int(s.get('unknown_reason_code_events'))}`",
         f"- profile_hash_missing_events: `{as_int(s.get('profile_hash_missing_events'))}` | profile_hash_mismatch_events: `{as_int(s.get('profile_hash_mismatch_events'))}`",
+        f"- manifest_hash_missing_events: `{as_int(s.get('manifest_hash_missing_events'))}` | manifest_hash_mismatch_events: `{as_int(s.get('manifest_hash_mismatch_events'))}` | manifest_hash_legacy_fallback_events: `{as_int(s.get('manifest_hash_legacy_fallback_events'))}`",
         f"- schema_version_mismatch_events: `{as_int(s.get('schema_version_mismatch_events'))}` | manifest_version_mismatch_events: `{as_int(s.get('manifest_version_mismatch_events'))}`",
         f"- invalid_run_id_events: `{as_int(s.get('invalid_run_id_events'))}` | run_id_hash_prefix_mismatch_events: `{as_int(s.get('run_id_hash_prefix_mismatch_events'))}`",
         f"- monotonic_order_violations: `{as_int(s.get('monotonic_order_violations'))}`",
@@ -479,15 +499,18 @@ def main() -> int:
             run_id_regex = RUN_ID_REGEX
     schema_events, schema_reasons, event_required_fields = extract_schema_contract(schema=schema)
 
-    expected_hashes: Set[str] = set()
-    manifest_profile_hash = ""
-    profile_profile_hash = ""
+    expected_manifest_hash = ""
+    expected_profile_hash = ""
     if manifest_path.exists():
-        manifest_profile_hash = f"sha256:{canonical_json_sha256(manifest_path)}"
-        expected_hashes.add(manifest_profile_hash)
+        expected_manifest_hash = f"sha256:{canonical_json_sha256(manifest_path)}"
     if profile_path.exists():
-        profile_profile_hash = f"sha256:{canonical_json_sha256(profile_path)}"
-        expected_hashes.add(profile_profile_hash)
+        expected_profile_hash = f"sha256:{canonical_json_sha256(profile_path)}"
+    expected_profile_hashes: Set[str] = set()
+    if expected_profile_hash:
+        expected_profile_hashes.add(expected_profile_hash)
+    if expected_manifest_hash:
+        # Compatibility: older logs used manifest hash in profile_hash.
+        expected_profile_hashes.add(expected_manifest_hash)
 
     events_path: Optional[Path] = None
     if str(args.events_jsonl).strip():
@@ -553,6 +576,7 @@ def main() -> int:
     event_counts: Counter[str] = Counter()
     skip_reason_counts: Counter[str] = Counter()
     profile_hash_values: Counter[str] = Counter()
+    manifest_hash_values: Counter[str] = Counter()
     stage_values: Counter[str] = Counter()
     strategy_values: Counter[str] = Counter()
     run_id_values: Counter[str] = Counter()
@@ -563,6 +587,9 @@ def main() -> int:
     unknown_reason_code_events = 0
     profile_hash_missing_events = 0
     profile_hash_mismatch_events = 0
+    manifest_hash_missing_events = 0
+    manifest_hash_mismatch_events = 0
+    manifest_hash_legacy_fallback_events = 0
     schema_version_mismatch_events = 0
     manifest_version_mismatch_events = 0
     invalid_run_id_events = 0
@@ -616,7 +643,12 @@ def main() -> int:
                 unknown_reason_code_events += 1
                 violation_counts_by_day[event_day]["unknown_reason_code"] += 1
 
-        if event_missing_fields(ev, required_common_fields):
+        missing_common_fields = event_missing_fields(ev, required_common_fields)
+        if "manifest_hash" in missing_common_fields:
+            legacy_profile_hash = normalize_profile_hash(ev.get("profile_hash"))
+            if expected_manifest_hash and legacy_profile_hash == expected_manifest_hash:
+                missing_common_fields = [f for f in missing_common_fields if f != "manifest_hash"]
+        if missing_common_fields:
             missing_common_field_events += 1
             violation_counts_by_day[event_day]["missing_common_fields"] += 1
 
@@ -628,12 +660,27 @@ def main() -> int:
         normalized_hash = normalize_profile_hash(ev.get("profile_hash"))
         if normalized_hash:
             profile_hash_values[normalized_hash] += 1
-            if expected_hashes and normalized_hash not in expected_hashes:
+            if expected_profile_hashes and normalized_hash not in expected_profile_hashes:
                 profile_hash_mismatch_events += 1
                 violation_counts_by_day[event_day]["profile_hash_mismatch"] += 1
         else:
             profile_hash_missing_events += 1
             violation_counts_by_day[event_day]["profile_hash_missing"] += 1
+
+        normalized_manifest_hash = normalize_manifest_hash(ev.get("manifest_hash"))
+        if not normalized_manifest_hash:
+            legacy_profile_hash = normalize_profile_hash(ev.get("profile_hash"))
+            if expected_manifest_hash and legacy_profile_hash == expected_manifest_hash:
+                normalized_manifest_hash = expected_manifest_hash
+                manifest_hash_legacy_fallback_events += 1
+        if normalized_manifest_hash:
+            manifest_hash_values[normalized_manifest_hash] += 1
+            if expected_manifest_hash and normalized_manifest_hash != expected_manifest_hash:
+                manifest_hash_mismatch_events += 1
+                violation_counts_by_day[event_day]["manifest_hash_mismatch"] += 1
+        else:
+            manifest_hash_missing_events += 1
+            violation_counts_by_day[event_day]["manifest_hash_missing"] += 1
 
         stage = str(ev.get("stage", "")).strip()
         if stage:
@@ -825,13 +872,26 @@ def main() -> int:
     strategy_id_consistent = all(sid == expected_strategy_id for sid in strategy_values) if strategy_values else True
     has_events = bool(events)
     # Day-0/no-input runs should be handled by ingestion checks, not treated as hash violations.
-    profile_hash_consistent = profile_hash_missing_events == 0 and (not has_events or len(profile_hash_values) == 1)
+    profile_hash_consistent = profile_hash_missing_events == 0 and (
+        not has_events
+        or len(profile_hash_values) == 1
+        or (expected_profile_hashes and set(profile_hash_values.keys()).issubset(expected_profile_hashes))
+    )
     profile_hash_matches_expected = (
         profile_hash_missing_events == 0
         and (
             not has_events
-            or not expected_hashes
+            or not expected_profile_hashes
             or profile_hash_mismatch_events == 0
+        )
+    )
+    manifest_hash_consistent = manifest_hash_missing_events == 0 and (not has_events or len(manifest_hash_values) == 1)
+    manifest_hash_matches_expected = (
+        manifest_hash_missing_events == 0
+        and (
+            not has_events
+            or not expected_manifest_hash
+            or manifest_hash_mismatch_events == 0
         )
     )
     schema_version_matches_expected = schema_version_mismatch_events == 0
@@ -852,6 +912,8 @@ def main() -> int:
         "run_id_hash_prefix_mismatch": int(run_id_hash_prefix_mismatch_events),
         "profile_hash_mismatch": int(profile_hash_mismatch_events),
         "profile_hash_missing": int(profile_hash_missing_events),
+        "manifest_hash_mismatch": int(manifest_hash_mismatch_events),
+        "manifest_hash_missing": int(manifest_hash_missing_events),
         "monotonic_order_violations": int(monotonic_order_violations),
         "lifecycle_fill_without_submit": int(len(fill_without_submit_ids)),
         "lifecycle_close_without_fill": int(len(close_without_fill_ids)),
@@ -902,6 +964,9 @@ def main() -> int:
         "unknown_reason_code_events": int(unknown_reason_code_events),
         "profile_hash_missing_events": int(profile_hash_missing_events),
         "profile_hash_mismatch_events": int(profile_hash_mismatch_events),
+        "manifest_hash_missing_events": int(manifest_hash_missing_events),
+        "manifest_hash_mismatch_events": int(manifest_hash_mismatch_events),
+        "manifest_hash_legacy_fallback_events": int(manifest_hash_legacy_fallback_events),
         "schema_version_expected": expected_schema_version,
         "manifest_version_expected": expected_manifest_version,
         "schema_version_mismatch_events": int(schema_version_mismatch_events),
@@ -922,6 +987,8 @@ def main() -> int:
         "contract_violation_counters": contract_violation_counters,
         "contract_violation_counters_by_day": contract_violation_counters_by_day,
         "profile_hash_values_seen": dict(profile_hash_values),
+        "manifest_hash_expected": expected_manifest_hash,
+        "manifest_hash_values_seen": dict(manifest_hash_values),
         "stage_values_seen": dict(stage_values),
         "strategy_values_seen": dict(strategy_values),
     }
@@ -937,6 +1004,8 @@ def main() -> int:
         "schema_reason_values_valid": unknown_reason_code_events == 0,
         "profile_hash_consistent": profile_hash_consistent,
         "profile_hash_matches_expected": profile_hash_matches_expected,
+        "manifest_hash_consistent": manifest_hash_consistent,
+        "manifest_hash_matches_expected": manifest_hash_matches_expected,
         "schema_version_matches_expected": schema_version_matches_expected,
         "manifest_version_matches_expected": manifest_version_matches_expected,
         "run_id_format_valid": run_id_format_valid,
@@ -959,6 +1028,8 @@ def main() -> int:
         "schema_reason_values_valid",
         "profile_hash_consistent",
         "profile_hash_matches_expected",
+        "manifest_hash_consistent",
+        "manifest_hash_matches_expected",
         "schema_version_matches_expected",
         "manifest_version_matches_expected",
         "run_id_format_valid",
@@ -1011,9 +1082,15 @@ def main() -> int:
             "schema_version": expected_schema_version,
             "manifest_version": expected_manifest_version,
         },
+        "expected_hashes": {
+            "manifest_hash": expected_manifest_hash,
+            "profile_hash": expected_profile_hash,
+            "accepted_profile_hashes": sorted(expected_profile_hashes),
+        },
+        # Backward-compatible alias retained for existing downstream consumers.
         "expected_profile_hashes": {
-            "manifest_hash": manifest_profile_hash,
-            "profile_hash": profile_profile_hash,
+            "manifest_hash": expected_manifest_hash,
+            "profile_hash": expected_profile_hash,
         },
     }
 

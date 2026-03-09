@@ -11,7 +11,17 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_COMMON_FIELDS = ["ts", "run_id", "event", "stage", "strategy_id", "profile_hash", "schema_version", "manifest_version"]
+DEFAULT_COMMON_FIELDS = [
+    "ts",
+    "run_id",
+    "event",
+    "stage",
+    "strategy_id",
+    "profile_hash",
+    "manifest_hash",
+    "schema_version",
+    "manifest_version",
+]
 DEFAULT_SCHEMA_VERSION = "1.0.0"
 DEFAULT_MANIFEST_VERSION = "1.0.0"
 RUN_ID_REGEX = re.compile(r"^(?P<date>\d{4}-\d{2}-\d{2})_(?P<session>[A-Z0-9]+)_sha(?P<hash>[a-f0-9]{8})$")
@@ -131,6 +141,15 @@ def normalize_profile_hash(value: Any) -> str:
     return f"sha256:{text}"
 
 
+def normalize_manifest_hash(value: Any) -> str:
+    text = str(value or "").strip().lower()
+    if not text:
+        return ""
+    if text.startswith("sha256:"):
+        return text
+    return f"sha256:{text}"
+
+
 def canonical_hash(obj: Any) -> str:
     data = json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
     return hashlib.sha256(data).hexdigest()
@@ -161,6 +180,9 @@ def main() -> int:
     manifest: Dict[str, Any] = {}
     if manifest_path.exists():
         manifest = load_json(manifest_path)
+    expected_manifest_hash = ""
+    if manifest_path.exists():
+        expected_manifest_hash = f"sha256:{canonical_hash(manifest)}"
     expected_schema_version, expected_manifest_version = get_expected_versions(manifest)
     run_id_pattern_text = str((manifest.get("event_contract", {}) or {}).get("run_id_pattern", "")).strip()
     run_id_regex = RUN_ID_REGEX
@@ -249,6 +271,7 @@ def main() -> int:
     event_counts: Counter[str] = Counter()
     skip_reason_counts: Counter[str] = Counter()
     profile_hash_values: Counter[str] = Counter()
+    manifest_hash_values: Counter[str] = Counter()
     run_id_values: Counter[str] = Counter()
     process_start_values: Counter[str] = Counter()
 
@@ -257,6 +280,9 @@ def main() -> int:
     fill_spread_values: List[float] = []
 
     missing_common_field_events = 0
+    manifest_hash_missing_events = 0
+    manifest_hash_mismatch_events = 0
+    manifest_hash_legacy_fallback_events = 0
     schema_version_mismatch_events = 0
     manifest_version_mismatch_events = 0
     invalid_run_id_events = 0
@@ -291,7 +317,12 @@ def main() -> int:
                     if run_hash_prefix != event_hash_prefix:
                         run_id_hash_prefix_mismatch_events += 1
 
-        if event_missing_fields(ev, required_common_fields):
+        missing_common_fields = event_missing_fields(ev, required_common_fields)
+        if "manifest_hash" in missing_common_fields:
+            legacy_profile_hash = normalize_profile_hash(ev.get("profile_hash"))
+            if expected_manifest_hash and legacy_profile_hash == expected_manifest_hash:
+                missing_common_fields = [f for f in missing_common_fields if f != "manifest_hash"]
+        if missing_common_fields:
             missing_common_field_events += 1
 
         process_start_ts = parse_ts(str(ev.get("process_start_ts", "")))
@@ -300,9 +331,22 @@ def main() -> int:
             if last_process_start_ts is None or process_start_ts > last_process_start_ts:
                 last_process_start_ts = process_start_ts
 
-        profile_hash = str(ev.get("profile_hash", "")).strip().lower()
+        profile_hash = normalize_profile_hash(ev.get("profile_hash"))
         if profile_hash:
             profile_hash_values[profile_hash] += 1
+
+        manifest_hash = normalize_manifest_hash(ev.get("manifest_hash"))
+        if not manifest_hash:
+            legacy_profile_hash = normalize_profile_hash(ev.get("profile_hash"))
+            if expected_manifest_hash and legacy_profile_hash == expected_manifest_hash:
+                manifest_hash = expected_manifest_hash
+                manifest_hash_legacy_fallback_events += 1
+        if manifest_hash:
+            manifest_hash_values[manifest_hash] += 1
+            if expected_manifest_hash and manifest_hash != expected_manifest_hash:
+                manifest_hash_mismatch_events += 1
+        else:
+            manifest_hash_missing_events += 1
 
         schema_version = str(ev.get("schema_version", "")).strip()
         if schema_version and schema_version != expected_schema_version:
@@ -381,6 +425,9 @@ def main() -> int:
         "mixed_side": mixed_side,
     }
     contract_violation_counters = {
+        "manifest_hash_missing": int(manifest_hash_missing_events),
+        "manifest_hash_mismatch": int(manifest_hash_mismatch_events),
+        "manifest_hash_legacy_fallback": int(manifest_hash_legacy_fallback_events),
         "schema_version_mismatch": int(schema_version_mismatch_events),
         "manifest_version_mismatch": int(manifest_version_mismatch_events),
         "invalid_run_id": int(invalid_run_id_events),
@@ -434,6 +481,9 @@ def main() -> int:
             "ingestion_state": ingestion_state,
             "event_counts": dict(sorted(event_counts.items())),
             "missing_common_field_events": int(missing_common_field_events),
+            "manifest_hash_missing_events": int(manifest_hash_missing_events),
+            "manifest_hash_mismatch_events": int(manifest_hash_mismatch_events),
+            "manifest_hash_legacy_fallback_events": int(manifest_hash_legacy_fallback_events),
             "schema_version_mismatch_events": int(schema_version_mismatch_events),
             "manifest_version_mismatch_events": int(manifest_version_mismatch_events),
             "invalid_run_id_events": int(invalid_run_id_events),
@@ -445,6 +495,8 @@ def main() -> int:
             "last_process_start_age_minutes": last_process_start_age_minutes,
             "monotonic_order_violations": int(monotonic_order_violations),
             "profile_hash_values_seen": dict(profile_hash_values),
+            "manifest_hash_expected": expected_manifest_hash,
+            "manifest_hash_values_seen": dict(manifest_hash_values),
             "trade_count": int(trade_count),
             "wins": int(wins),
             "losses": int(losses),

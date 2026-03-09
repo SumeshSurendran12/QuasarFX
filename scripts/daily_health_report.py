@@ -315,6 +315,8 @@ def main() -> int:
     schema_reason_values_valid = bool(paper_checks.get("schema_reason_values_valid", False))
     profile_hash_consistent = bool(paper_checks.get("profile_hash_consistent", False))
     profile_hash_matches_expected = bool(paper_checks.get("profile_hash_matches_expected", False))
+    manifest_hash_consistent = bool(paper_checks.get("manifest_hash_consistent", False))
+    manifest_hash_matches_expected = bool(paper_checks.get("manifest_hash_matches_expected", False))
     schema_version_matches_expected = bool(paper_checks.get("schema_version_matches_expected", False))
     manifest_version_matches_expected = bool(paper_checks.get("manifest_version_matches_expected", False))
     run_id_format_valid = bool(paper_checks.get("run_id_format_valid", False))
@@ -408,6 +410,16 @@ def main() -> int:
             "name": "profile_hash_matches_expected",
             "pass": profile_hash_matches_expected,
             "detail": f"profile_hash_mismatch_events={as_int(summary.get('profile_hash_mismatch_events'), 0)}",
+        },
+        {
+            "name": "manifest_hash_consistent",
+            "pass": manifest_hash_consistent,
+            "detail": f"manifest_hash_values_seen={summary.get('manifest_hash_values_seen', {})}",
+        },
+        {
+            "name": "manifest_hash_matches_expected",
+            "pass": manifest_hash_matches_expected,
+            "detail": f"manifest_hash_mismatch_events={as_int(summary.get('manifest_hash_mismatch_events'), 0)}",
         },
         {
             "name": "schema_version_matches_expected",
@@ -528,6 +540,8 @@ def main() -> int:
             "schema_reason_values_valid",
             "profile_hash_consistent",
             "profile_hash_matches_expected",
+            "manifest_hash_consistent",
+            "manifest_hash_matches_expected",
             "schema_version_matches_expected",
             "manifest_version_matches_expected",
             "run_id_format_valid",

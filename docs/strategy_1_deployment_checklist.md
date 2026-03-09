@@ -35,6 +35,7 @@ Daily status log: `docs/strategy_1_daily_status_log.md`
 - Spread-gate skips logged
 - API failures logged
 - Profile hash logged on every event
+- Manifest hash logged on every event
 - schema_version + manifest_version logged on every event
 - Daily health report generated (`scripts/daily_health_report.py`)
 - Daily pipeline scheduled (`scripts/run_daily_paper_pipeline.ps1`) and runs summary -> paper -> health in that order
